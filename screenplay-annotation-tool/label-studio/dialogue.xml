@@ -1,0 +1,41 @@
+<View>
+  <Header value="Dialogue annotation"/>
+  <Text name="film" value="$film_title"/>
+  <Text name="time" value="$timecode"/>
+  <Text name="speaker" value="$speaker"/>
+  <View style="display:flex;gap:24px;align-items:flex-start">
+    <View style="width:50%;direction:rtl;text-align:right">
+      <Header value="متن اصلی فارسی"/>
+      <Text name="fa" value="$text_fa"/>
+    </View>
+    <View style="width:50%">
+      <Header value="English translation — verify against audio and context"/>
+      <Text name="en" value="$text_en"/>
+    </View>
+  </View>
+  <Header value="1. Temporal character sentiment — viewer perception"/>
+  <Choices name="character_sentiment" toName="fa" choice="single" required="true">
+    <Choice value="Positive"/><Choice value="Negative"/><Choice value="Neutral"/><Choice value="Insufficient evidence"/>
+  </Choices>
+  <TextArea name="character_sentiment_rationale" toName="fa" required="true" rows="2" placeholder="Evidence from this moment and preceding context"/>
+  <Header value="2. Dialogue sentiment — speaker private state"/>
+  <Choices name="dialogue_sentiment" toName="fa" choice="single" required="true">
+    <Choice value="Positive"/><Choice value="Negative"/><Choice value="Neutral"/><Choice value="Insufficient evidence"/>
+  </Choices>
+  <TextArea name="dialogue_sentiment_rationale" toName="fa" required="true" rows="2" placeholder="Why this private state, including any mismatch with surface wording"/>
+  <Header value="3. Pragmatic intent"/>
+  <Choices name="pragmatic_intent" toName="fa" choice="single" required="true">
+    <Choice value="Taarof"/><Choice value="Sarcasm/Irony"/><Choice value="Evasion/Deception"/><Choice value="Genuine/Direct"/><Choice value="Insufficient evidence"/>
+  </Choices>
+  <TextArea name="pragmatic_intent_rationale" toName="fa" required="true" rows="2" placeholder="Contextual and linguistic evidence"/>
+  <Header value="4. Offensive language"/>
+  <Choices name="offensive_language" toName="fa" choice="single" required="true">
+    <Choice value="Non-Offensive"/><Choice value="Mild Insult"/><Choice value="Severe Insult/Vulgarity"/><Choice value="Threatening/Intimidating"/><Choice value="Gaslighting/Manipulative"/><Choice value="Insufficient evidence"/>
+  </Choices>
+  <TextArea name="offensive_language_rationale" toName="fa" required="true" rows="2" placeholder="Phrase and situational evidence"/>
+  <Header value="Translation review"/>
+  <Choices name="translation_review" toName="en" choice="single" required="true">
+    <Choice value="Approved"/><Choice value="Needs revision"/>
+  </Choices>
+  <TextArea name="translation_note" toName="en" rows="2" placeholder="Explain idiom, taarof, implied meaning, or a needed correction"/>
+</View>
