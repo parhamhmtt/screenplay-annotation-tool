@@ -1,1 +1,0 @@
-"""Local film annotation application."""
