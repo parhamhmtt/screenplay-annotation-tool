@@ -1,0 +1,68 @@
+{
+  "name": "Persian film dialogue corpus",
+  "source_language": "fa",
+  "translation_language": "en",
+  "kinds": ["dialogue", "description", "character_event"],
+  "description_kinds": ["Visual action", "Scene setting", "Sound cue", "Speaker identification"],
+  "tasks": {
+    "character_sentiment": {
+      "number": 1,
+      "title": "Character sentiment",
+      "help": "How the viewer perceives this character at this point. Cite an action or a narrative shift. Optional on a dialogue turn; required on a character-event record.",
+      "applies_to": ["dialogue", "character_event"],
+      "required_on": ["character_event"],
+      "labels": ["Positive", "Negative", "Neutral", "Insufficient evidence"],
+      "gloss": {
+        "Positive": "Sympathetic / moral",
+        "Negative": "Unsympathetic / compromised",
+        "Neutral": "Ambiguous",
+        "Insufficient evidence": "Not enough evidence"
+      }
+    },
+    "dialogue_sentiment": {
+      "number": 2,
+      "title": "Dialogue sentiment",
+      "help": "The speaker's private state, even if the surface wording is calm. Example: 'I didn't hear them' with panic and self-preservation.",
+      "applies_to": ["dialogue"],
+      "required_on": ["dialogue"],
+      "labels": ["Positive", "Negative", "Neutral", "Insufficient evidence"],
+      "gloss": {
+        "Positive": "Genuine relief or affection",
+        "Negative": "Suppressed fear or resentment",
+        "Neutral": "Detached / numb",
+        "Insufficient evidence": "Not enough evidence"
+      }
+    },
+    "pragmatic_intent": {
+      "number": 3,
+      "title": "Pragmatic intent",
+      "help": "Primary communicative intent of this turn. Politeness alone is not taarof.",
+      "applies_to": ["dialogue"],
+      "required_on": ["dialogue"],
+      "labels": ["Taarof", "Sarcasm/Irony", "Evasion/Deception", "Genuine/Direct", "Insufficient evidence"],
+      "gloss": {
+        "Taarof": "Politeness masking intent",
+        "Sarcasm/Irony": "Sarcasm or irony",
+        "Evasion/Deception": "Evasion or deception",
+        "Genuine/Direct": "Genuine / direct",
+        "Insufficient evidence": "Not enough evidence"
+      }
+    },
+    "offensive_language": {
+      "number": 4,
+      "title": "Offensive language",
+      "help": "One class for the whole turn. If both a severe insult and a threat are present, pick the main act and mention both in the rationale.",
+      "applies_to": ["dialogue"],
+      "required_on": ["dialogue"],
+      "labels": ["Non-Offensive", "Mild Insult", "Severe Insult/Vulgarity", "Threatening/Intimidating", "Gaslighting/Manipulative", "Insufficient evidence"],
+      "gloss": {
+        "Non-Offensive": "No insult",
+        "Mild Insult": "Mild insult",
+        "Severe Insult/Vulgarity": "Severe insult or vulgarity",
+        "Threatening/Intimidating": "Threat or intimidation",
+        "Gaslighting/Manipulative": "Gaslighting / manipulation",
+        "Insufficient evidence": "Not enough evidence"
+      }
+    }
+  }
+}

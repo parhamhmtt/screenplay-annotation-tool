@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="fa">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Screenplay Annotation Tool</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="toast" role="status"></div>
+  <div id="workspace">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark">FA</div><div><strong>استودیوی حاشیه‌نویسی فیلم</strong><span>Persian original · English translation</span></div></div>
+      <div class="top-actions">
+        <label class="identity">هویت کاری
+          <select id="actor-select" aria-label="هویت کاری"></select>
+        </label>
+        <span id="role-hint"></span>
+      </div>
+    </header>
+    <div class="shell">
+      <aside class="sidebar">
+        <label class="field-label" for="film-select">فیلم</label>
+        <select id="film-select"></select>
+        <div id="survey" class="survey"></div>
+        <p id="release-note" class="muted compact"></p>
+        <div id="track-list" class="tracks muted compact"></div>
+        <div id="sdh-summary" class="sdh-summary"></div>
+        <div id="reviewer-tools">
+          <button id="add-film" class="secondary full">+ فیلم</button>
+          <div class="section-title">منابع</div>
+          <label class="upload-button">پیوند ویدئو<input id="media-file" type="file" accept="video/mp4,video/webm,.mkv" hidden></label>
+          <label class="upload-button">ورود SRT فارسی<input id="fa-file" type="file" accept=".srt" hidden></label>
+          <label class="upload-button">ورود SRT انگلیسی<input id="en-file" type="file" accept=".srt" hidden></label>
+          <label class="upload-button">ورود SRT مخصوص ناشنوایان<input id="sdh-file" type="file" accept=".srt" hidden></label>
+          <button id="review-sdh" class="secondary full">وضعیت SDH</button>
+          <button id="edit-release" class="secondary full">شناسهٔ نسخه</button>
+          <div class="section-title">رکورد تازه</div>
+          <button id="new-dialogue" class="secondary full">+ نوبت دیالوگ</button>
+          <button id="new-character" class="secondary full">+ رویداد شخصیت</button>
+          <button id="new-description" class="secondary full">+ توضیح صحنه / صدا</button>
+          <div class="section-title">بازبینی و خروجی</div>
+          <button id="review-mode" class="secondary full">صف بازبینی</button>
+          <button id="export-gold" class="secondary full">خروجی gold JSONL</button>
+          <button id="export-all" class="secondary full">خروجی همهٔ JSONL</button>
+          <button id="export-fa-srt" class="secondary full">SRT فارسی اصلاح‌شده</button>
+          <button id="export-en-srt" class="secondary full">SRT انگلیسی تأییدشده</button>
+          <button id="add-user" class="secondary full">حاشیه‌نویس اضافه</button>
+        </div>
+        <div class="section-title">پیشرفت</div>
+        <div id="stats" class="stats muted">فیلم را انتخاب کنید.</div>
+      </aside>
+      <section class="main-panel">
+        <div class="media-pane">
+          <div class="media-heading"><h2 id="film-title">فیلم</h2><span id="media-note" class="muted"></span></div>
+          <video id="video" controls preload="metadata"></video>
+          <div class="player-actions">
+            <button id="seek-start" class="quiet" type="button">ابتدای رکورد</button>
+            <button id="seek-prev" class="quiet" type="button">− ۳ ثانیه</button>
+            <button id="seek-next" class="quiet" type="button">+ ۳ ثانیه</button>
+            <button id="add-description" class="quiet" type="button">توضیح در همین لحظه</button>
+            <span id="player-time" class="muted">00:00:00.000</span>
+          </div>
+        </div>
+        <div class="records-pane">
+          <div class="records-head">
+            <div><h2>دیالوگ‌ها و توضیحات</h2><p id="record-count" class="muted compact"></p></div>
+            <div class="filters">
+              <input id="search" placeholder="جست‌وجوی فارسی، انگلیسی، گوینده">
+              <select id="kind-filter" aria-label="نوع رکورد">
+                <option value="all">همهٔ انواع</option>
+                <option value="dialogue">دیالوگ</option>
+                <option value="character_event">رویداد شخصیت</option>
+                <option value="description">توضیح</option>
+              </select>
+              <select id="gap-filter" aria-label="وضعیت برچسب">
+                <option value="all">همهٔ وضعیت‌ها</option>
+                <option value="mine-missing">بدون برچسب کامل من</option>
+                <option value="focus-missing">تسک انتخاب‌شده مانده</option>
+              </select>
+            </div>
+          </div>
+          <div class="list-nav">
+            <button id="prev-record" class="quiet" type="button">رکورد قبلی</button>
+            <button id="next-record" class="quiet" type="button">رکورد بعدی</button>
+          </div>
+          <div id="review-banner" class="review-banner hidden"><strong>صف بازبینی</strong><span>اختلاف‌ها و ۲۰٪ نمونهٔ توافق‌ها.</span><button id="show-all" class="quiet" type="button">نمایش همه</button></div>
+          <div id="record-list" class="record-list"></div>
+        </div>
+      </section>
+      <section class="detail-panel">
+        <div id="empty-detail" class="empty-state"><div>◈</div><h2>یک رکورد را انتخاب کنید</h2><p>متن فارسی اصل است. ترجمهٔ انگلیسی را بازبین تأیید می‌کند. هر تسک کلاس و دلیل جدا دارد.</p></div>
+        <div id="detail" class="hidden">
+          <div class="detail-head"><div><span id="kind-pill" class="pill"></span><h2 id="detail-title">رکورد</h2></div><span id="detail-status" class="status"></span></div>
+          <div id="read-only-record">
+            <div class="time-line" id="readonly-time"></div>
+            <div class="speaker-line" id="readonly-speaker"></div>
+            <div class="bilingual"><div><small>اصل · فارسی</small><p id="readonly-fa" dir="rtl"></p></div><div><small>ترجمه · English</small><p id="readonly-en"></p></div></div>
+            <p id="readonly-note" class="muted compact"></p>
+            <p id="translation-lock" class="warning compact hidden"></p>
+          </div>
+          <div id="editor">
+            <div class="section-title">متن و ترجمه <small>بازبین، پیش از برچسب‌گذاری تأیید می‌کند</small></div>
+            <label>گوینده<input id="speaker" placeholder="نام / نامشخص"></label>
+            <label>فارسی اصلی<textarea id="text-fa" dir="rtl" rows="3"></textarea></label>
+            <label>ترجمهٔ انگلیسی<textarea id="text-en" rows="3"></textarea></label>
+            <div class="translation-row"><label>وضعیت ترجمه<select id="translation-status"><option value="needed">نیاز به ترجمه</option><option value="candidate">نامزد واردشده</option><option value="draft">پیش‌نویس مدل</option><option value="needs_revision">نیاز به اصلاح</option><option value="approved">تأییدشده</option></select></label><button id="translate" class="secondary" type="button">پیش‌نویس LLM</button></div>
+            <label>یادداشت منبع<textarea id="record-note" rows="2"></textarea></label>
+            <button id="save-record" class="primary full" type="button">ذخیرهٔ متن و ترجمه</button>
+            <details id="timing-tools">
+              <summary>زمان، تقسیم و ادغام</summary>
+              <div class="time-grid"><label>شروع (ms)<input id="start-ms" type="number" min="0"></label><label>پایان (ms)<input id="end-ms" type="number" min="1"></label></div>
+              <div class="inline-actions"><button id="start-from-video" class="quiet" type="button">شروع از پخش</button><button id="end-from-video" class="quiet" type="button">پایان از پخش</button></div>
+              <div class="inline-actions"><button id="split-record" class="quiet" type="button">تقسیم در پخش</button><button id="merge-record" class="quiet" type="button">ادغام با بعدی</button></div>
+              <p class="warning compact">تغییر متن یا زمان، نسخهٔ رکورد را عوض می‌کند و برچسب‌های قبلی از توافق کنار می‌روند.</p>
+            </details>
+          </div>
+          <div id="task-switch" class="task-switch"></div>
+          <div id="annotation-area">
+            <div class="section-title" id="annotation-heading">برچسب شما</div>
+            <p class="muted compact">کلاس هر تسک فقط مال همان تسک است. دلیل را بنویسید تا ثبت شود.</p>
+            <div id="task-fields"></div>
+            <div class="save-row"><button id="save-annotation" class="primary" type="button">ثبت برچسب</button><button id="save-next" class="secondary" type="button">ثبت و بعدی</button></div>
+          </div>
+          <div id="review-area">
+            <div class="section-title">برچسب‌های مستقل</div>
+            <div id="independent-annotations"></div>
+            <div class="section-title">داوری نهایی</div>
+            <div id="review-fields"></div>
+            <button id="save-adjudication" class="primary full" type="button">ثبت داوری</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
