@@ -1,4 +1,55 @@
-# Screenplay Annotator — standalone MVP
+# Screenplay Annotation Tool
+
+The updated PySide6 desktop workspace is in [`desktop/`](desktop/). It brings the
+four screenplay tasks into one task selector, with a focused label editor,
+bilingual dialogue, optional video, neighboring context, and a searchable line queue.
+
+![Desktop annotation workspace](desktop/docs/interface.png)
+
+## Run the updated app
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r desktop/requirements.txt
+.\.venv\Scripts\python.exe desktop/app.py
+```
+
+After setup, double-click **launch_annotator.cmd**. To try the bundled examples:
+
+```powershell
+.\.venv\Scripts\python.exe desktop/app.py --subs desktop/sample/demo.fa.srt --subs2 desktop/sample/demo.en.srt --annotator demo
+```
+
+The app uses an explicit light theme with readable fields and selection colors.
+Select a task to choose a label and enter its reason. Task states show what is
+complete or needs attention. **Next pending line** follows the selected task and
+the current queue filters. Single-key shortcuts stay inactive while typing.
+
+Use **Create task template…** to define reusable tasks, choices, instructions,
+single or multiple labels, per-character entries, and optional or required reasons.
+Select the saved template when opening a new subtitle project. Changes autosave,
+and exports support JSONL, JSON, and CSV. Saved annotations reject mismatched task
+templates to prevent edits under different label definitions.
+
+See the [desktop guide](desktop/README.md) for details. This workspace supports
+timed dialogue and subtitles. It does not implement image boxes, span annotation,
+or adjudication. Earlier implementations and their launchers remain below and
+use their own data formats; their working files are not automatically migrated.
+
+## Test the updated app
+
+```powershell
+Push-Location desktop
+..\.venv\Scripts\python.exe -I -m unittest discover -s tests
+Pop-Location
+```
+
+The 12 tests cover storage and export, subtitle parsing, task selection, filtered
+pending navigation, typing, reusable templates, and failed-save protection.
+
+---
+
+# Earlier standalone MVP
 
 This repository now includes a small, fully offline PySide6 annotation app in the root files [`app.py`](app.py) and [`core.py`](core.py). It is independent of the older `app/` package described below. Python 3.9+ and PySide6 are required; PySide6 is the only third-party dependency for this MVP.
 
