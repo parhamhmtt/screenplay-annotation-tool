@@ -1,277 +1,433 @@
-"""Subtitle parsing and durable, Qt-independent annotation storage."""
-from __future__ import annotations
-
+#!/usr/bin/env python3
+"""Core logic (no GUI): subtitle parsing, label schema, project storage, export. Standard library only."""
 import csv
 import hashlib
 import html
+import io
 import json
 import os
 import re
-import tempfile
-from pathlib import Path
+import threading
+from datetime import datetime, timezone
 
-MAX_RATIONALE = 4000
+HERE = os.path.dirname(os.path.abspath(__file__))
+PREFS_FILE = os.path.join(os.path.expanduser("~"), ".screenplay_annotator.json")
 
-DEFAULT_SCHEMA = {"tasks": [
-    {"id": "character_sentiment", "code": "CS", "name": "Character sentiment", "description": "Viewer's perception of a character at this moment.", "per_character": True, "multi": False, "rationale": "required", "labels": [
-        {"value": "Positive", "hint": "Sympathetic / moral", "color": "#5d9e75"}, {"value": "Negative", "hint": "Unsympathetic / compromised", "color": "#d16a66"}, {"value": "Neutral", "hint": "Ambiguous", "color": "#8091aa"}]},
-    {"id": "dialogue_sentiment", "code": "DS", "name": "Dialogue sentiment", "description": "Private state of the speaker, beyond surface tone.", "per_character": False, "multi": False, "rationale": "required", "labels": [
-        {"value": "Positive", "hint": "Genuine relief / affection", "color": "#5d9e75"}, {"value": "Negative", "hint": "Suppressed fear / resentment", "color": "#d16a66"}, {"value": "Neutral", "hint": "Detached / numb", "color": "#8091aa"}]},
-    {"id": "pragmatic_intent", "code": "PI", "name": "Pragmatic intent", "description": "What the utterance is doing in context.", "per_character": False, "multi": False, "rationale": "required", "labels": [
-        {"value": "Taarof", "hint": "Politeness masking intent", "color": "#aa80bd"}, {"value": "Sarcasm/Irony", "hint": "Ironic meaning", "color": "#d39b5d"}, {"value": "Evasion/Deception", "hint": "Avoiding or concealing", "color": "#d16a66"}, {"value": "Genuine/Direct", "hint": "Direct intent", "color": "#5d9e75"}]},
-    {"id": "offensive_language", "code": "OL", "name": "Offensive language", "description": "Insult, threat, or manipulation in this line.", "per_character": False, "multi": False, "rationale": "required", "labels": [
-        {"value": "Non-Offensive", "hint": "No offense", "color": "#8091aa"}, {"value": "Mild Insult", "hint": "E.g. shameless", "color": "#d3aa5d"}, {"value": "Severe Insult/Vulgarity", "hint": "E.g. you trash", "color": "#d16a66"}, {"value": "Threatening/Intimidating", "hint": "Threat or intimidation", "color": "#b65151"}, {"value": "Gaslighting/Manipulative", "hint": "Manipulative speech", "color": "#aa80bd"}]}]}
+# --------------------------------------------------------------------------- schema
+# Default schema = the four tasks from the "Screenplay Annotation" slides.
+# Task keys:  id, name, short, description, labels[{value,hint,color}],
+#             per_character (list of {character,label,rationale}), multi (several labels),
+#             rationale ("required" | "optional").
+DEFAULT_SCHEMA = {
+    "name": "screenplay-v0",
+    "tasks": [
+        {
+            "id": "character_sentiment", "short": "CS", "name": "Character Sentiment",
+            "description": "Viewer's perception of a character at this moment (temporal).",
+            "per_character": True, "multi": False, "rationale": "required",
+            "labels": [
+                {"value": "Positive", "hint": "Sympathetic / moral", "color": "#2e9e5b"},
+                {"value": "Negative", "hint": "Unsympathetic / compromised", "color": "#d64545"},
+                {"value": "Neutral", "hint": "Ambiguous", "color": "#7f8794"},
+            ],
+        },
+        {
+            "id": "dialogue_sentiment", "short": "DS", "name": "Dialogue Sentiment",
+            "description": "Private state of the speaker, not the calm/loud surface.",
+            "per_character": False, "multi": False, "rationale": "required",
+            "labels": [
+                {"value": "Positive", "hint": "Genuine relief / affection", "color": "#2e9e5b"},
+                {"value": "Negative", "hint": "Suppressed fear / resentment", "color": "#d64545"},
+                {"value": "Neutral", "hint": "Detached / numb", "color": "#7f8794"},
+            ],
+        },
+        {
+            "id": "pragmatic_intent", "short": "PI", "name": "Pragmatic Intent",
+            "description": "What the speaker is really doing with the sentence.",
+            "per_character": False, "multi": False, "rationale": "required",
+            "labels": [
+                {"value": "Taarof", "hint": "Politeness masking intent", "color": "#8e5bd6"},
+                {"value": "Sarcasm/Irony", "hint": "", "color": "#e08a1e"},
+                {"value": "Evasion/Deception", "hint": "", "color": "#b5533c"},
+                {"value": "Genuine/Direct", "hint": "", "color": "#1f9aa8"},
+            ],
+        },
+        {
+            "id": "offensive_language", "short": "OL", "name": "Offensive Language",
+            "description": "Nuanced offensiveness taxonomy.",
+            "per_character": False, "multi": False, "rationale": "required",
+            "labels": [
+                {"value": "Non-Offensive", "hint": "", "color": "#7f8794"},
+                {"value": "Mild Insult", "hint": "e.g. \"Shameless\"", "color": "#d9a400"},
+                {"value": "Severe Insult/Vulgarity", "hint": "e.g. \"You trash\"", "color": "#d64545"},
+                {"value": "Threatening/Intimidating", "hint": "", "color": "#a3263d"},
+                {"value": "Gaslighting/Manipulative", "hint": "", "color": "#8e5bd6"},
+            ],
+        },
+    ],
+}
 
 
 def load_schema(path=None):
-    schema = json.loads(Path(path).read_text(encoding="utf-8-sig")) if path else DEFAULT_SCHEMA
-    tasks = schema.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        raise ValueError("Schema needs a nonempty tasks array")
+    if not path:
+        return json.loads(json.dumps(DEFAULT_SCHEMA))
+    with open(path, encoding="utf-8") as f:
+        s = json.load(f)
+    return normalize_schema(s)
+
+
+def normalize_schema(s):
+    """Validate a reusable task template and fill the supported defaults."""
+    if not isinstance(s, dict) or not isinstance(s.get("tasks"), list) or not s["tasks"]:
+        raise ValueError("A task template must contain at least one task.")
+    s = json.loads(json.dumps(s))
+    s.setdefault("name", "Custom annotation")
     ids = set()
-    for task in tasks:
-        if not all(k in task for k in ("id", "code", "name", "description", "labels", "per_character", "multi", "rationale")):
-            raise ValueError("Task has missing fields")
-        if task["id"] in ids or task["rationale"] not in ("required", "optional"):
-            raise ValueError("Duplicate task or invalid rationale rule")
-        ids.add(task["id"])
-        labels = task["labels"]
-        if not labels or any(not all(k in label for k in ("value", "hint", "color")) for label in labels):
-            raise ValueError("Each task needs labeled values, hints and colors")
-        if len({label["value"] for label in labels}) != len(labels):
-            raise ValueError("Duplicate label")
-    return schema
+    for t in s["tasks"]:
+        if not isinstance(t, dict) or not isinstance(t.get("id"), str) or not t["id"].strip():
+            raise ValueError("Each task needs a nonempty id.")
+        if t["id"] in ids:
+            raise ValueError("duplicate task id: " + t["id"])
+        ids.add(t["id"])
+        t.setdefault("short", t["id"][:2].upper())
+        t.setdefault("name", t["id"])
+        t.setdefault("description", "")
+        t.setdefault("per_character", False)
+        t.setdefault("multi", False)
+        t.setdefault("rationale", "required")
+        if t["rationale"] not in ("required", "optional"):
+            raise ValueError("Rationale must be required or optional: " + t["id"])
+        if not isinstance(t.get("labels"), list) or not t["labels"]:
+            raise ValueError("Add at least one label to task: " + t["name"])
+        values = set()
+        for i, lab in enumerate(t["labels"]):
+            if isinstance(lab, str):
+                lab = t["labels"][i] = {"value": lab}
+            if not isinstance(lab, dict) or not isinstance(lab.get("value"), str) or not lab["value"].strip():
+                raise ValueError("Labels must have a nonempty name in task: " + t["name"])
+            if lab["value"] in values:
+                raise ValueError("Duplicate label in %s: %s" % (t["name"], lab["value"]))
+            values.add(lab["value"])
+            lab.setdefault("hint", "")
+            lab.setdefault("color", "#7f8794")
+    return s
 
 
-def decode_subtitles(raw, encoding=None):
+# --------------------------------------------------------------------------- subtitles
+TIME_RE = re.compile(r"(?:(\d+):)?(\d+):(\d+)[.,](\d{1,3})")
+
+
+def _secs(m):
+    h, mi, s, ms = m.groups()
+    return int(h or 0) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")) / 1000.0
+
+
+def _clean(text):
+    text = re.sub(r"<[^>]+>", "", text)           # <i>, <font ...>
+    text = re.sub(r"\{[^}]*\}", "", text)         # {\an8}, ASS overrides
+    text = html.unescape(text)
+    lines = [ln.strip() for ln in text.split("\n")]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def read_text(path, encoding=None):
+    with open(path, "rb") as f:
+        raw = f.read()
     if encoding:
         return raw.decode(encoding)
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
-    if raw[:100].count(b"\x00") > len(raw[:100]) // 5:
-        return raw.decode("utf-16-le" if raw[1:2] == b"\x00" else "utf-16-be")
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        pass
-    try:
-        persian = raw.decode("cp1256")
-        if sum("\u0600" <= c <= "\u08ff" for c in persian) >= max(1, sum(c.isalpha() for c in persian) // 10):
-            return persian
-    except UnicodeDecodeError:
-        pass
-    return raw.decode("latin-1")
+    for enc in ("utf-8-sig", "cp1256", "latin-1"):   # cp1256 = legacy Persian/Arabic files
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", "replace")
 
 
-def clean_text(value):
-    value = re.sub(r"\{\\[^}]*\}", "", value)
-    value = re.sub(r"<[^>]*>", "", value)
-    value = html.unescape(value)
-    return "\n".join(line.strip() for line in value.splitlines()).strip()
-
-
-def timestamp(value):
-    value = value.strip().replace(",", ".")
-    parts = value.split(":")
-    if len(parts) == 2:
-        parts.insert(0, "0")
-    if len(parts) != 3:
-        raise ValueError("Invalid subtitle timestamp: " + value)
-    return int((int(parts[0])*3600 + int(parts[1])*60 + float(parts[2]))*1000 + .5)
-
-
-def parse_subtitles(source, extension=".srt", encoding=None):
-    if isinstance(source, (str, Path)) and "\n" not in str(source) and Path(source).is_file():
-        path = Path(source)
-        extension = path.suffix.lower()
-        text = decode_subtitles(path.read_bytes(), encoding)
-    elif isinstance(source, bytes):
-        text = decode_subtitles(source, encoding)
-    else:
-        text = str(source)
-    extension = extension.lower()
+def parse_srt_vtt(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
     cues = []
-    if extension in (".srt", ".vtt"):
-        text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
-        for block in re.split(r"\n\s*\n", text):
-            lines = block.splitlines()
-            for i, line in enumerate(lines):
-                match = re.search(r"((?:\d+:)?\d{2}:\d{2}[,.]\d{3})\s*-->\s*((?:\d+:)?\d{2}:\d{2}[,.]\d{3})", line)
-                if match:
-                    start, end = timestamp(match[1]), timestamp(match[2])
-                    body = clean_text("\n".join(lines[i+1:]))
-                    if body and end > start:
-                        cues.append((start, end, body))
-                    break
-    elif extension in (".ass", ".ssa"):
-        in_events = False
-        fields = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("["):
-                in_events = line.lower() == "[events]"
-            elif in_events and line.lower().startswith("format:"):
-                fields = [x.strip().lower() for x in line[7:].split(",")]
-            elif in_events and line.lower().startswith("dialogue:") and fields:
-                values = [x.strip() for x in line[9:].split(",", len(fields)-1)]
-                if len(values) == len(fields):
-                    row = dict(zip(fields, values))
-                    try:
-                        start, end = timestamp(row["start"]), timestamp(row["end"])
-                        body = clean_text(re.sub(r"\\[Nn]", "\n", row["text"]))
-                        if body and end > start:
-                            cues.append((start, end, body))
-                    except (KeyError, ValueError):
-                        pass
+    for block in re.split(r"\n\s*\n", text):
+        lines = block.split("\n")
+        for k, ln in enumerate(lines):
+            if "-->" in ln:
+                a, _, b = ln.partition("-->")
+                ma, mb = TIME_RE.search(a), TIME_RE.search(b)
+                if ma and mb:
+                    cues.append((_secs(ma), _secs(mb), _clean("\n".join(lines[k + 1:]))))
+                break
+    return cues
+
+
+def parse_ass(text):
+    cues, fmt, in_events = [], None, False
+    for ln in text.replace("\r", "").split("\n"):
+        s = ln.strip()
+        if s.startswith("["):
+            in_events = s.lower() == "[events]"
+            continue
+        if not in_events:
+            continue
+        low = s.lower()
+        if low.startswith("format:"):
+            fmt = [x.strip().lower() for x in s[7:].split(",")]
+        elif low.startswith("dialogue:") and fmt:
+            d = dict(zip(fmt, s[9:].lstrip().split(",", len(fmt) - 1)))
+            ma, mb = TIME_RE.search(d.get("start", "")), TIME_RE.search(d.get("end", ""))
+            if ma and mb:
+                body = d.get("text", "").replace("\\N", "\n").replace("\\n", "\n")
+                cues.append((_secs(ma), _secs(mb), _clean(body)))
+    return cues
+
+
+def parse_subtitles(path, encoding=None):
+    text = read_text(path, encoding)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".ass", ".ssa") or "[Events]" in text[:5000]:
+        cues = parse_ass(text)
     else:
-        raise ValueError("Supported subtitles: SRT, VTT, ASS, SSA")
-    if not cues:
-        raise ValueError("No valid subtitle cues found")
-    return sorted(cues, key=lambda cue: (cue[0], cue[1]))
+        cues = parse_srt_vtt(text)
+    cues = [c for c in cues if c[2]]
+    cues.sort(key=lambda c: (c[0], c[1]))
+    return cues
 
 
 def align(primary, secondary):
-    result = []
-    for start, end, _ in primary:
-        matches = []
-        for s, e, body in secondary:
-            overlap = min(end, e) - max(start, s)
-            if overlap > 0 and overlap / min(end-start, e-s) >= .4:
-                matches.append(body)
-        result.append("\n".join(matches))
-    return result
+    """For each primary cue return the text of secondary cues that overlap it in time."""
+    out = []
+    for ps, pe, _ in primary:
+        pd = max(pe - ps, 0.05)
+        parts = []
+        for ss, se, st in secondary:
+            if ss > pe + 0.5:
+                break
+            ov = min(pe, se) - max(ps, ss)
+            if ov > 0 and ov / min(pd, max(se - ss, 0.05)) >= 0.4:
+                parts.append(st.replace("\n", " "))
+        out.append(" ".join(parts))
+    return out
 
 
-def make_lines(primary, secondary=()):
-    aligned = align(primary, secondary) if secondary else [""] * len(primary)
-    return [{"id": i, "uid": hashlib.sha1(f"{i}|{start}|{body}".encode("utf-8")).hexdigest()[:10],
-             "start": start, "end": end, "text1": body, "text2": aligned[i-1]}
-            for i, (start, end, body) in enumerate(primary, 1)]
+# --------------------------------------------------------------------------- project
+def _expand(p):
+    p = (p or "").strip().strip('"').strip("'")
+    return os.path.abspath(os.path.expanduser(p)) if p else ""
 
 
-def normalize_annotations(data, schema):
-    tasks = {task["id"]: task for task in schema["tasks"]}
-    clean = {}
-    for task_id, value in data.items():
-        if task_id not in tasks:
-            raise ValueError("Unknown task: " + task_id)
-        task = tasks[task_id]
-        allowed = {label["value"] for label in task["labels"]}
-        entries = value if task["per_character"] else [value]
-        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
-            raise ValueError("Invalid annotation structure")
-        normalized = []
-        for entry in entries:
-            label = entry.get("label", []) if task["multi"] else entry.get("label", "")
-            if task["multi"]:
-                label = [str(x).strip() for x in label]
-                if any(x not in allowed for x in label):
-                    raise ValueError("Unknown label in " + task_id)
-            else:
-                label = str(label).strip()
-                if label and label not in allowed:
-                    raise ValueError("Unknown label in " + task_id)
-            rationale = str(entry.get("rationale", "")).strip()[:MAX_RATIONALE]
-            item = {"label": label, "rationale": rationale}
-            if task["per_character"]:
-                item["character"] = str(entry.get("character", "")).strip()[:120]
-            if label or rationale or (task["per_character"] and item["character"]):
-                normalized.append(item)
-        if normalized:
-            clean[task_id] = normalized if task["per_character"] else normalized[0]
-    return clean
-
-
-def incomplete(data, schema):
-    for task in schema["tasks"]:
-        value = data.get(task["id"])
-        for entry in (value if task["per_character"] else [value]) if value else []:
-            label = entry.get("label")
-            rationale = entry.get("rationale", "")
-            if (rationale and not label) or (label and task["rationale"] == "required" and not rationale):
-                return True
-            if task["per_character"] and not entry.get("character"):
-                return True
-    return False
-
-
-def working_path(outdir, movie, subs, annotator):
-    stem = Path(movie or subs).stem
-    safe = re.sub(r"[^\w.-]+", "_", annotator.strip(), flags=re.UNICODE).strip("._")
-    if not safe:
-        raise ValueError("Annotator name is required")
-    return Path(outdir) / f"{stem}.{safe}.annotations.json"
-
-
-def atomic_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=".screenplay-", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-    finally:
-        if os.path.exists(temp):
-            os.unlink(temp)
+def _safe(name):
+    return re.sub(r"[^\w\-.]+", "_", name, flags=re.UNICODE).strip("._") or "annotator"
 
 
 class Project:
-    def __init__(self, subs, subs2="", movie="", lang1="fa", lang2="en", annotator="", schema_path="", outdir="", encoding=""):
-        self.subs, self.subs2, self.movie = str(subs), str(subs2), str(movie)
-        self.lang1, self.lang2, self.annotator = lang1.strip(), lang2.strip(), annotator.strip()
-        if not self.lang1 or not self.lang2 or self.lang1 == self.lang2:
-            raise ValueError("Enter two distinct language codes")
-        self.schema = load_schema(schema_path or None)
-        self.lines = make_lines(parse_subtitles(subs, encoding=encoding or None), parse_subtitles(subs2, encoding=encoding or None) if subs2 else ())
-        self.path = working_path(outdir or Path(subs).parent / "annotations", movie, subs, self.annotator)
-        self.annotations = {}
-        self.stale = []
-        self.orphans = {}
-        if self.path.exists():
-            saved = json.loads(self.path.read_text(encoding="utf-8"))
-            current = {line["uid"] for line in self.lines}
-            self.stale = [uid for uid in saved.get("annotations", {}) if uid not in current]
-            self.orphans = {uid: value for uid, value in saved.get("annotations", {}).items() if uid not in current}
-            self.annotations = {uid: normalize_annotations(value, self.schema) for uid, value in saved.get("annotations", {}).items() if uid in current}
+    def __init__(self, cfg):
+        self.lock = threading.RLock()
+        self.cfg = {
+            "movie": _expand(cfg.get("movie")),
+            "subs": _expand(cfg.get("subs")),
+            "subs2": _expand(cfg.get("subs2")),
+            "lang1": (cfg.get("lang1") or "fa").strip(),
+            "lang2": (cfg.get("lang2") or "en").strip(),
+            "annotator": (cfg.get("annotator") or "annotator1").strip(),
+            "schema": _expand(cfg.get("schema")),
+            "outdir": _expand(cfg.get("outdir")),
+            "encoding": (cfg.get("encoding") or "").strip(),
+        }
+        c = self.cfg
+        if not c["subs"] or not os.path.isfile(c["subs"]):
+            raise ValueError("Subtitle file not found: %r" % c["subs"])
+        if c["movie"] and not os.path.isfile(c["movie"]):
+            raise ValueError("Movie file not found: %r" % c["movie"])
+        if c["subs2"] and not os.path.isfile(c["subs2"]):
+            raise ValueError("Second subtitle file not found: %r" % c["subs2"])
+        self.schema = load_schema(c["schema"] or None)
+        enc = c["encoding"] or None
+        cues = parse_subtitles(c["subs"], enc)
+        if not cues:
+            raise ValueError("No subtitle cues could be parsed from " + c["subs"])
+        t2 = align(cues, parse_subtitles(c["subs2"], enc)) if c["subs2"] else [""] * len(cues)
+        self.lines = []
+        for i, ((s, e, t1), x2) in enumerate(zip(cues, t2), 1):
+            uid = hashlib.sha1(("%d|%.3f|%s" % (i, s, t1)).encode("utf-8")).hexdigest()[:10]
+            self.lines.append({"id": i, "uid": uid, "start": s, "end": e, "t1": t1, "t2": x2})
+        outdir = c["outdir"] or os.path.join(os.path.dirname(c["subs"]), "annotations")
+        os.makedirs(outdir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(c["movie"] or c["subs"]))[0]
+        self.path = os.path.join(outdir, "%s.%s.annotations.json" % (_safe(base), _safe(c["annotator"])))
+        self.items, self.warnings = {}, []
+        self._load()
 
-    def set_annotation(self, uid, data):
-        if uid not in {line["uid"] for line in self.lines}:
-            raise ValueError("Unknown line UID")
-        value = normalize_annotations(data, self.schema)
-        if value:
-            self.annotations[uid] = value
-        else:
-            self.annotations.pop(uid, None)
+    # --- persistence
+    def _load(self):
+        if not os.path.isfile(self.path):
+            return
+        with open(self.path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("schema") != self.schema["name"] or (data.get("task_schema") is not None and
+                                                         data["task_schema"] != self.schema):
+            raise ValueError("Saved annotations use a different task template. Select the original template, "
+                             "or choose a different annotator name or output folder for the new tasks.")
+        uids = {l["id"]: l["uid"] for l in self.lines}
+        stale = 0
+        for k, v in data.get("items", {}).items():
+            i = int(k)
+            if i not in uids:
+                stale += 1
+                continue
+            if v.get("uid") != uids[i]:
+                stale += 1
+            self.items[i] = {"uid": uids[i], "tasks": v.get("tasks", {})}
+        if stale:
+            self.warnings.append("%d saved annotation(s) did not match the current subtitle file "
+                                 "(different file or edited text) - please review them." % stale)
 
-    def save(self):
-        atomic_json(self.path, {"version": 1, "annotator": self.annotator, "movie": self.movie,
-                                "subs": self.subs, "lang1": self.lang1, "lang2": self.lang2,
-                                "annotations": {**self.orphans, **self.annotations}})
+    def _write(self):
+        data = {"version": 1, "annotator": self.cfg["annotator"], "schema": self.schema["name"],
+                "task_schema": self.schema,
+                "movie": os.path.basename(self.cfg["movie"]), "subs": os.path.basename(self.cfg["subs"]),
+                "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "items": {str(i): v for i, v in sorted(self.items.items())}}
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
 
-    def records(self, include_unannotated=False):
-        for line in self.lines:
-            ann = self.annotations.get(line["uid"], {})
-            if ann or include_unannotated:
-                yield {"id": line["id"], "uid": line["uid"], "start": line["start"], "end": line["end"],
-                       f"text_{self.lang1}": line["text1"], f"text_{self.lang2}": line["text2"],
-                       "annotator": self.annotator, "movie": self.movie, "annotations": ann}
+    # --- validation + update
+    def validate(self, tasks):
+        out = {}
+        by_id = {t["id"]: t for t in self.schema["tasks"]}
+        for tid, val in (tasks or {}).items():
+            t = by_id.get(tid)
+            if t is None:
+                raise ValueError("unknown task: %s" % tid)
+            allowed = {l["value"] for l in t["labels"]}
 
-    def export(self, path, fmt, include_unannotated=False):
-        records = list(self.records(include_unannotated))
-        path = Path(path)
+            def one(e, need_char):
+                lab = e.get("label", [] if t["multi"] else "")
+                if t["multi"]:
+                    lab = [x for x in (lab if isinstance(lab, list) else [lab]) if x]
+                    bad = [x for x in lab if x not in allowed]
+                else:
+                    lab = lab or ""
+                    bad = [lab] if lab and lab not in allowed else []
+                if bad:
+                    raise ValueError("label %r not in task %s" % (bad[0], tid))
+                r = {"label": lab, "rationale": str(e.get("rationale", "")).strip()[:5000]}
+                if need_char:
+                    r = {"character": str(e.get("character", "")).strip()[:200], **r}
+                return r
+
+            if t["per_character"]:
+                rows = [one(e, True) for e in (val if isinstance(val, list) else [])]
+                rows = [r for r in rows if r["character"] or r["label"] or r["rationale"]]
+                if rows:
+                    out[tid] = rows
+            else:
+                r = one(val if isinstance(val, dict) else {}, False)
+                if r["label"] or r["rationale"]:
+                    out[tid] = r
+        return out
+
+    def set_annotation(self, line_id, tasks):
+        with self.lock:
+            if not 1 <= line_id <= len(self.lines):
+                raise ValueError("bad line id")
+            clean = self.validate(tasks)
+            if clean:
+                self.items[line_id] = {"uid": self.lines[line_id - 1]["uid"], "tasks": clean}
+            else:
+                self.items.pop(line_id, None)
+            self._write()
+
+    # --- export
+    def records(self, include_all=False):
+        c, l1, l2 = self.cfg, self.cfg["lang1"], self.cfg["lang2"]
+        for ln in self.lines:
+            it = self.items.get(ln["id"])
+            if not it and not include_all:
+                continue
+            rec = {"id": ln["id"], "uid": ln["uid"], "start": round(ln["start"], 3),
+                   "end": round(ln["end"], 3), "text_" + l1: ln["t1"]}
+            if c["subs2"]:
+                rec["text_" + l2] = ln["t2"]
+            rec["annotator"] = c["annotator"]
+            rec["movie"] = os.path.basename(c["movie"]) if c["movie"] else ""
+            rec["annotations"] = it["tasks"] if it else {}
+            yield rec
+
+    def export(self, fmt, include_all=False):
+        recs = list(self.records(include_all))
         if fmt == "jsonl":
-            path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records), encoding="utf-8")
-        elif fmt == "json":
-            path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        elif fmt == "csv":
-            with path.open("w", encoding="utf-8-sig", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=["id", "uid", "start", "end", f"text_{self.lang1}", f"text_{self.lang2}", "annotator", "movie", "annotations"])
-                writer.writeheader()
-                for row in records:
-                    row["annotations"] = json.dumps(row["annotations"], ensure_ascii=False)
-                    writer.writerow(row)
-        else:
-            raise ValueError("Export format must be jsonl, json, or csv")
+            return "\n".join(json.dumps(r, ensure_ascii=False) for r in recs) + "\n", "application/x-ndjson"
+        if fmt == "json":
+            return json.dumps(recs, ensure_ascii=False, indent=1), "application/json"
+        if fmt == "csv":
+            buf = io.StringIO()
+            base = ["id", "start", "end", "text_" + self.cfg["lang1"]] + \
+                   (["text_" + self.cfg["lang2"]] if self.cfg["subs2"] else []) + ["annotator"]
+            cols = base + [x for t in self.schema["tasks"] for x in (t["id"] + "_label", t["id"] + "_rationale")]
+            w = csv.DictWriter(buf, cols, extrasaction="ignore")
+            w.writeheader()
+            for r in recs:
+                row = {k: r.get(k, "") for k in base}
+                for t in self.schema["tasks"]:
+                    v = r["annotations"].get(t["id"])
+                    if v is None:
+                        continue
+                    if t["per_character"]:
+                        row[t["id"] + "_label"] = "; ".join("%s=%s" % (x["character"], x["label"]) for x in v)
+                        row[t["id"] + "_rationale"] = " | ".join(x["rationale"] for x in v)
+                    else:
+                        lab = v["label"]
+                        row[t["id"] + "_label"] = "; ".join(lab) if isinstance(lab, list) else lab
+                        row[t["id"] + "_rationale"] = v["rationale"]
+                w.writerow(row)
+            return "﻿" + buf.getvalue(), "text/csv"       # BOM so Excel reads Persian
+        raise ValueError("unknown format")
+
+
+# --------------------------------------------------------------------------- entry state helpers
+def entry_state(task, e):
+    """'empty' | 'ok' | 'incomplete' for one task's stored value (dict, or list of rows if per_character)."""
+    if not e:
+        return "empty"
+    rows = e if task["per_character"] else [e]
+    rows = [r for r in rows if r.get("label") or r.get("rationale", "").strip() or r.get("character", "").strip()]
+    if not rows:
+        return "empty"
+    for r in rows:
+        if task["per_character"] and not r.get("character", "").strip():
+            return "incomplete"
+        if not r.get("label"):
+            return "incomplete"
+        if task["rationale"] == "required" and not r.get("rationale", "").strip():
+            return "incomplete"
+    return "ok"
+
+
+def line_state(project, line_id):
+    """(annotated?, incomplete?) for a line."""
+    tasks = (project.items.get(line_id) or {}).get("tasks", {})
+    any_, inc = False, False
+    for t in project.schema["tasks"]:
+        s = entry_state(t, tasks.get(t["id"]))
+        any_ |= s != "empty"
+        inc |= s == "incomplete"
+    return any_, inc
+
+
+# --------------------------------------------------------------------------- preferences
+def load_prefs():
+    try:
+        with open(PREFS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_prefs(cfg):
+    try:
+        with open(PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+    except OSError:
+        pass

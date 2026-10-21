@@ -1,698 +1,1276 @@
-"""Native, offline Screenplay Annotator. Run: python app.py --help"""
-from __future__ import annotations
+#!/usr/bin/env python3
+"""Screenplay Annotator - native desktop app (PySide6) for labeling movie dialogue.
 
+    pip install PySide6
+    python app.py                                   # then File > Open...
+    python app.py --movie film.mp4 --subs film.fa.srt --subs2 film.en.srt \
+                  --lang1 fa --lang2 en --annotator parsa
+    python app.py --dump-schema my_schema.json      # default schema to edit
+"""
 import argparse
+import bisect
+import html as _html
 import json
+import os
 import sys
-from pathlib import Path
+from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut, QTextOption
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtCore import QEvent, QSize, QStringListModel, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QKeySequence, QPalette, QShortcut, QTextOption
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSlider, QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
-    QHeaderView
-)
+    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QListWidget, QListWidgetItem, QPushButton, QProgressBar, QScrollArea, QSlider, QSplitter,
+    QStackedWidget, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import core
 
-SETTINGS = Path.home() / ".screenplay_annotator.json"
+try:                                    # video is optional: without it the app still labels/edits subtitles
+    from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    HAS_MM = os.environ.get("SA_NO_VIDEO") != "1"
+except ImportError:
+    HAS_MM = False
+
+NOFOCUS = Qt.FocusPolicy.NoFocus
+GREY = "#52627a"
 
 
-def direction(text):
-    arabic = sum(1 for c in text if "\u0600" <= c <= "\u08ff")
-    latin = sum(1 for c in text if "A" <= c <= "z")
-    return Qt.LayoutDirection.RightToLeft if arabic > latin else Qt.LayoutDirection.LeftToRight
+def apply_theme():
+    """Own both text and surface colors, independent of the OS light/dark theme."""
+    app = QApplication.instance()
+    if app.property("annotationTheme"):
+        return
+    app.setStyle("Fusion")
+    palette = QPalette()
+    for role, color in ((QPalette.Window, "#f3f5f9"), (QPalette.WindowText, "#172b46"),
+                        (QPalette.Base, "#ffffff"), (QPalette.AlternateBase, "#f2f6fc"),
+                        (QPalette.Text, "#172b46"), (QPalette.Button, "#ffffff"),
+                        (QPalette.ButtonText, "#172b46"), (QPalette.Highlight, "#dce9ff"),
+                        (QPalette.HighlightedText, "#143e78"), (QPalette.ToolTipBase, "#172b46"),
+                        (QPalette.ToolTipText, "#ffffff"), (QPalette.PlaceholderText, "#52627a")):
+        palette.setColor(role, QColor(color))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.Text, QColor("#66758a"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ButtonText, QColor("#66758a"))
+    app.setPalette(palette)
+    app.setStyleSheet("""
+        QWidget { font-family: 'Segoe UI', Tahoma; font-size: 13px; color: #172b46; }
+        QMainWindow, QDialog { background: #f3f5f9; }
+        QLabel { background: transparent; }
+        QLabel#sectionTitle { font-size: 16px; font-weight: 700; }
+        QLabel#muted { color: #52627a; }
+        QFrame#currentLine { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; }
+        QPushButton { background: #ffffff; color: #172b46; border: 1px solid #becbdb;
+                      border-radius: 5px; padding: 7px 10px; }
+        QPushButton:hover { background: #eaf1fc; border-color: #7494bf; }
+        QPushButton:pressed, QPushButton:checked { background: #2458a6; color: #ffffff; }
+        QPushButton:focus, QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border: 2px solid #2458a6; }
+        QPushButton:disabled { background: #edf0f4; color: #66758a; border-color: #d3dce8; }
+        QPushButton#primary { background: #2458a6; color: #ffffff; border-color: #2458a6; font-weight: 600; }
+        QPushButton#primary:hover { background: #1c4788; }
+        QLineEdit, QPlainTextEdit, QComboBox { background: #ffffff; color: #172b46;
+            selection-background-color: #dce9ff; selection-color: #143e78;
+            border: 1px solid #becbdb; border-radius: 5px; padding: 6px; }
+        QComboBox QAbstractItemView { background: #ffffff; color: #172b46;
+            selection-background-color: #dce9ff; selection-color: #143e78; }
+        QTreeWidget, QListWidget { background: #ffffff; alternate-background-color: #f2f6fc;
+            color: #172b46; border: 1px solid #cbd5e1; border-radius: 6px;
+            selection-background-color: #dce9ff; selection-color: #143e78; }
+        QTreeWidget::item { padding: 7px 4px; }
+        QListWidget::item { padding: 7px; border-bottom: 1px solid #e5eaf2; }
+        QTreeWidget::item:selected, QListWidget::item:selected { background: #dce9ff; color: #143e78; }
+        QHeaderView::section { background: #eaf0f8; color: #334966; padding: 7px 4px;
+            border: 0; border-bottom: 1px solid #cbd5e1; font-weight: 600; }
+        QScrollArea { background: transparent; border: 0; }
+        QScrollArea > QWidget > QWidget { background: transparent; }
+        QMenuBar, QMenu, QToolBar { background: #ffffff; color: #172b46; }
+        QMenu::item:selected, QMenuBar::item:selected { background: #dce9ff; color: #143e78; }
+        QToolBar { border-bottom: 1px solid #d3dce8; spacing: 8px; padding: 5px; }
+        QToolButton { padding: 7px 10px; color: #172b46; }
+        QToolButton:hover { background: #eaf1fc; }
+        QToolTip { background: #172b46; color: #ffffff; border: 0; padding: 6px; }
+        QProgressBar { border: 0; border-radius: 3px; background: #e3eaf4; color: #172b46; }
+        QProgressBar::chunk { background: #2458a6; border-radius: 3px; }
+        QStatusBar { background: #ffffff; color: #52627a; }
+        QSplitter::handle { background: #dce3ed; }
+    """)
+    app.setProperty("annotationTheme", True)
 
 
-def timecode(ms):
-    s, milli = divmod(max(0, int(ms)), 1000)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h:02}:{m:02}:{s:02}.{milli:03}"
+# --------------------------------------------------------------------------- helpers
+def is_rtl(s):
+    ar = sum(1 for c in s if "֐" <= c <= "ࣿ" or "יִ" <= c <= "ﻼ")
+    la = sum(1 for c in s if c.isascii() and c.isalpha())
+    return ar > la
 
 
-def button(text, callback):
-    widget = QPushButton(text)
-    widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    widget.clicked.connect(callback)
-    return widget
+def rich(text, color=None):
+    """HTML paragraph with the right base direction (Qt honours <p dir/align>, not <div>)."""
+    if not text:
+        return ""
+    rtl = is_rtl(text)
+    return '<p dir="%s" align="%s" style="margin:0 0 2px 0;%s">%s</p>' % (
+        "rtl" if rtl else "ltr", "right" if rtl else "left", "color:%s;" % color if color else "",
+        _html.escape(text).replace("\n", "<br>"))
+
+
+def cell(text):
+    """Plain text for list cells: an RTL embedding makes punctuation/word order correct for Persian."""
+    text = text.replace("\n", " ")
+    return "\u202b" + text + "\u202c" if is_rtl(text) else text
+
+
+def fmt(t):
+    t = max(0.0, t)
+    h, m, s = int(t // 3600), int(t % 3600 // 60), int(t % 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+def auto_dir(edit):
+    doc = edit.document()
+    opt = doc.defaultTextOption()
+    opt.setTextDirection(Qt.LayoutDirection.LayoutDirectionAuto)
+    doc.setDefaultTextOption(opt)
+
+
+# --------------------------------------------------------------------------- widgets
+class EntryEditor(QWidget):
+    """Label buttons + rationale (+ character name for per-character tasks)."""
+    changed = Signal()
+    focused = Signal()
+
+    def __init__(self, task, with_char, char_model):
+        super().__init__()
+        self.task = task
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.char = self.del_btn = None
+        if with_char:
+            top = QHBoxLayout()
+            self.char = QLineEdit()
+            self.char.setPlaceholderText("Character")
+            comp = QCompleter(char_model, self.char)
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            self.char.setCompleter(comp)
+            self.char.textChanged.connect(self.changed)
+            self.char.installEventFilter(self)
+            top.addWidget(self.char)
+            self.del_btn = QPushButton("×")
+            self.del_btn.setFocusPolicy(NOFOCUS)
+            self.del_btn.setFixedWidth(28)
+            self.del_btn.setToolTip("Remove this character")
+            top.addWidget(self.del_btn)
+            lay.addLayout(top)
+        grid = QGridLayout()
+        grid.setSpacing(5)
+        self.btns = []
+        for k, lab in enumerate(task["labels"]):
+            b = QPushButton("%d   %s" % (k + 1, lab["value"]) + ("\n" + lab["hint"] if lab.get("hint") else ""))
+            b.setCheckable(True)
+            b.setFocusPolicy(NOFOCUS)
+            b.setToolTip(lab.get("hint", "") or "Select this label. Click again to clear it.")
+            b.setStyleSheet("QPushButton{text-align:left;padding:7px;min-height:20px;}"
+                            "QPushButton:checked{background:#2458a6;color:#ffffff;border:2px solid #173e78;font-weight:600;}")
+            b.clicked.connect(lambda checked=False, i=k: self._clicked(i))
+            grid.addWidget(b, k // 2, k % 2)
+            self.btns.append(b)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        lay.addLayout(grid)
+        self.rat = QPlainTextEdit()
+        self.rat.setPlaceholderText("Rationale%s - why this label?" % (" (required)" if task["rationale"] == "required" else ""))
+        hint = QLabel("Reason for this label" + (" (required)" if task["rationale"] == "required" else " (optional)"))
+        lay.addWidget(hint)
+        self.rat.setMinimumHeight(64)
+        self.rat.setMaximumHeight(96)
+        auto_dir(self.rat)
+        self.rat.textChanged.connect(self.changed)
+        self.rat.installEventFilter(self)
+        lay.addWidget(self.rat)
+
+    def eventFilter(self, o, e):
+        if e.type() == QEvent.Type.FocusIn:
+            self.focused.emit()
+        return False
+
+    def _clicked(self, i):
+        if not self.task["multi"]:
+            for j, b in enumerate(self.btns):
+                if j != i:
+                    b.setChecked(False)
+        self.focused.emit()
+        self.changed.emit()
+
+    def get(self):
+        vals = [self.task["labels"][k]["value"] for k, b in enumerate(self.btns) if b.isChecked()]
+        d = {"label": vals if self.task["multi"] else (vals[0] if vals else ""), "rationale": self.rat.toPlainText()}
+        if self.char is not None:
+            d = {"character": self.char.text(), **d}
+        return d
+
+    def set(self, d):
+        for w in [self.rat, self.char] + self.btns:
+            if w is not None:
+                w.blockSignals(True)
+        lab = d.get("label", [] if self.task["multi"] else "")
+        lab = lab if isinstance(lab, list) else [lab]
+        for k, b in enumerate(self.btns):
+            b.setChecked(self.task["labels"][k]["value"] in lab)
+        self.rat.setPlainText(d.get("rationale", ""))
+        if self.char is not None:
+            self.char.setText(d.get("character", ""))
+        for w in [self.rat, self.char] + self.btns:
+            if w is not None:
+                w.blockSignals(False)
+
+
+class TaskCard(QFrame):
+    changed = Signal(object)
+    focused = Signal(object)
+
+    def __init__(self, task, idx, char_model):
+        super().__init__()
+        self.task, self.idx, self.char_model = task, idx, char_model
+        self.setObjectName("card")
+        lay = QVBoxLayout(self)
+        lay.setSpacing(6)
+        self.title = QLabel()
+        self.title.setTextFormat(Qt.TextFormat.RichText)
+        self.title.setWordWrap(True)
+        lay.addWidget(self.title)
+        mode = QLabel("Choose all labels that apply." if task["multi"] else "Choose one label. Click it again to clear the selection.")
+        mode.setObjectName("muted")
+        mode.setWordWrap(True)
+        mode.setVisible(task["multi"])
+        lay.addWidget(mode)
+        self.rows = []
+        if task["per_character"]:
+            self.rows_box = QVBoxLayout()
+            lay.addLayout(self.rows_box)
+            self.empty_hint = QLabel("Add a character, then choose a label and give a reason for this task.")
+            self.empty_hint.setWordWrap(True)
+            self.empty_hint.setObjectName("muted")
+            lay.addWidget(self.empty_hint)
+            add = QPushButton("+ Add character")
+            add.setFocusPolicy(NOFOCUS)
+            add.clicked.connect(lambda: self.add_row(focus=True))
+            lay.addWidget(add, alignment=Qt.AlignmentFlag.AlignLeft)
+        else:
+            self.editor = EntryEditor(task, False, char_model)
+            self.editor.changed.connect(lambda: self.changed.emit(self))
+            self.editor.focused.connect(lambda: self.focused.emit(self))
+            lay.addWidget(self.editor)
+        self.refresh_style(False, "empty")
+
+    def add_row(self, data=None, focus=False):
+        ed = EntryEditor(self.task, True, self.char_model)
+        ed.changed.connect(lambda: self.changed.emit(self))
+        ed.focused.connect(lambda: self.focused.emit(self))
+        ed.del_btn.clicked.connect(lambda: self.remove_row(ed))
+        self.rows.append(ed)
+        self.empty_hint.hide()
+        self.rows_box.addWidget(ed)
+        if data:
+            ed.set(data)
+        if focus:
+            ed.char.setFocus()
+        return ed
+
+    def remove_row(self, ed):
+        self.rows.remove(ed)
+        self.rows_box.removeWidget(ed)
+        ed.hide()
+        ed.deleteLater()
+        self.empty_hint.setVisible(not self.rows)
+        self.changed.emit(self)
+
+    def load(self, entry):
+        if self.task["per_character"]:
+            for ed in self.rows:
+                self.rows_box.removeWidget(ed)
+                ed.hide()
+                ed.deleteLater()
+            self.rows = []
+            self.empty_hint.setVisible(not entry)
+            for r in entry or []:
+                self.add_row(r)
+        else:
+            self.editor.set(entry or {"label": [] if self.task["multi"] else "", "rationale": ""})
+
+    def collect(self):
+        return [r.get() for r in self.rows] if self.task["per_character"] else self.editor.get()
+
+    def toggle_label(self, k):
+        if self.task["per_character"]:
+            ed = self.rows[-1] if self.rows else self.add_row()
+            ed.btns[k].click()
+            if not ed.char.text():
+                ed.char.setFocus()
+        else:
+            self.editor.btns[k].click()
+
+    def focus_rationale(self):
+        ed = (self.rows[-1] if self.rows else None) if self.task["per_character"] else self.editor
+        if ed:
+            ed.rat.setFocus()
+
+    def refresh_style(self, active, state):
+        col = "#3556d8" if active else {"ok": "#2e9e5b", "incomplete": "#e08a1e"}.get(state, "#9aa1ae")
+        self.setStyleSheet("QFrame#card{background:#ffffff;border:1px solid #cbd5e1;border-radius:8px;}")
+        mark = {"ok": " <span style='color:#17613a'>Complete</span>", "incomplete": " <span style='color:#925000'>Needs a label, character, or reason</span>"}.get(state, "")
+        self.title.setText("<b>%s</b>%s<br><span style='color:%s'>%s</span>" % (
+            _html.escape(self.task["name"]), mark, GREY, _html.escape(self.task.get("description", ""))))
+
+
+class TemplateDialog(QDialog):
+    """Create reusable classification tasks without hand editing JSON."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Create task template")
+        self.resize(760, 650)
+        source = parent.P.schema if parent.P else core.DEFAULT_SCHEMA
+        self.tasks = json.loads(json.dumps(source["tasks"]))
+        self.current = -1
+        layout = QVBoxLayout(self)
+        intro = QLabel("Define the tasks and choices for a new project. Save this template, then select it when opening subtitles.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.template_name = QLineEdit(source["name"])
+        form = QFormLayout()
+        form.addRow("Template name", self.template_name)
+        layout.addLayout(form)
+        self.tasks_list = QListWidget()
+        self.tasks_list.setMaximumHeight(140)
+        self.tasks_list.addItems([t["name"] for t in self.tasks])
+        layout.addWidget(self.tasks_list)
+        buttons = QHBoxLayout()
+        add = QPushButton("+ Add task")
+        remove = QPushButton("Remove task")
+        add.clicked.connect(self.add_task)
+        remove.clicked.connect(self.remove_task)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        layout.addLayout(buttons)
+        form = QFormLayout()
+        self.task_name = QLineEdit()
+        self.description = QLineEdit()
+        self.labels = QPlainTextEdit()
+        self.labels.setPlaceholderText("One choice per line. Optional guidance after |\nPositive | Genuine relief or affection\nNegative | Fear or resentment\nNeutral")
+        self.labels.setMinimumHeight(120)
+        self.multi = QCheckBox("Allow multiple labels for this task")
+        self.per_character = QCheckBox("Annotate each character separately")
+        self.required = QCheckBox("Require a reason for each label")
+        form.addRow("Task name", self.task_name)
+        form.addRow("Instructions", self.description)
+        form.addRow("Label choices\n(one per line)", self.labels)
+        form.addRow(self.multi)
+        form.addRow(self.per_character)
+        form.addRow(self.required)
+        layout.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        self.tasks_list.currentRowChanged.connect(self.select_task)
+        self.tasks_list.setCurrentRow(0)
+
+    def store_task(self):
+        if not 0 <= self.current < len(self.tasks):
+            return
+        task = self.tasks[self.current]
+        task["name"] = self.task_name.text().strip()
+        task["description"] = self.description.text().strip()
+        task["multi"] = self.multi.isChecked()
+        task["per_character"] = self.per_character.isChecked()
+        task["rationale"] = "required" if self.required.isChecked() else "optional"
+        old = {l["value"]: l for l in task["labels"]}
+        labels = []
+        for line in self.labels.toPlainText().splitlines():
+            if line.strip():
+                value, _, hint = line.partition("|")
+                value = value.strip()
+                labels.append({"value": value, "hint": hint.strip(), "color": old.get(value, {}).get("color", "#52627a")})
+        task["labels"] = labels
+        self.tasks_list.item(self.current).setText(task["name"] or "Unnamed task")
+
+    def select_task(self, row):
+        self.store_task()
+        self.current = row
+        if row < 0:
+            return
+        task = self.tasks[row]
+        self.task_name.setText(task["name"])
+        self.description.setText(task["description"])
+        self.labels.setPlainText("\n".join(l["value"] + (" | " + l["hint"] if l.get("hint") else "") for l in task["labels"]))
+        self.multi.setChecked(task["multi"])
+        self.per_character.setChecked(task["per_character"])
+        self.required.setChecked(task["rationale"] == "required")
+
+    def add_task(self):
+        self.store_task()
+        number = len(self.tasks) + 1
+        while any(t["id"] == "task_%d" % number for t in self.tasks):
+            number += 1
+        task = {"id": "task_%d" % number, "short": "T%d" % number, "name": "New task",
+                "description": "", "multi": False, "per_character": False, "rationale": "required",
+                "labels": [{"value": "Choice 1", "hint": "", "color": "#52627a"}]}
+        self.tasks.append(task)
+        self.tasks_list.addItem(task["name"])
+        self.tasks_list.setCurrentRow(len(self.tasks) - 1)
+
+    def remove_task(self):
+        row = self.tasks_list.currentRow()
+        if row < 0 or len(self.tasks) <= 1:
+            return
+        self.current = -1
+        self.tasks_list.blockSignals(True)
+        self.tasks.pop(row)
+        self.tasks_list.takeItem(row)
+        self.tasks_list.blockSignals(False)
+        new_row = min(row, len(self.tasks) - 1)
+        self.tasks_list.setCurrentRow(new_row)
+        self.select_task(new_row)
+
+    def schema(self):
+        self.store_task()
+        return core.normalize_schema({"name": self.template_name.text().strip() or "Custom annotation", "tasks": self.tasks})
+
+    def accept(self):
+        try:
+            schema = self.schema()
+            if any(not t["name"] for t in schema["tasks"]):
+                raise ValueError("Give every task a name.")
+        except ValueError as error:
+            QMessageBox.warning(self, "Check task template", str(error))
+            return
+        super().accept()
 
 
 class OpenDialog(QDialog):
-    def __init__(self, parent=None, values=None):
+    def __init__(self, parent, defaults):
         super().__init__(parent)
-        self.setWindowTitle("Open annotation project")
-        self.setMinimumWidth(650)
-        values = values or {}
+        self.setWindowTitle("Open project")
+        self.setMinimumWidth(560)
         form = QFormLayout(self)
-        self.fields = {}
-        for key, label, kind in (("movie", "Movie (optional)", "file"), ("subs", "Subtitle 1", "file"),
-                                 ("subs2", "Subtitle 2 (optional)", "file"), ("schema", "Schema JSON (optional)", "file"),
-                                 ("outdir", "Output folder", "dir"), ("lang1", "Language 1", "text"),
-                                 ("lang2", "Language 2", "text"), ("annotator", "Annotator", "text"),
-                                 ("encoding", "Encoding override (optional)", "text")):
-            edit = QLineEdit(str(values.get(key, "")))
-            self.fields[key] = edit
-            if kind == "text":
-                form.addRow(label, edit)
-            else:
-                row = QHBoxLayout()
-                row.addWidget(edit)
-                row.addWidget(button("Browse…", lambda _, e=edit, k=kind: self.browse(e, k)))
-                form.addRow(label, row)
-        actions = QHBoxLayout()
-        actions.addStretch()
-        actions.addWidget(button("Cancel", self.reject))
-        actions.addWidget(button("Open", self.accept))
-        form.addRow(actions)
+        intro = QLabel("Open dialogue subtitles and choose an annotator name. Video and a second language are optional.\nLeave Task template blank to use the four screenplay tasks.")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+        self.f = {}
 
-    def browse(self, edit, kind):
-        if kind == "dir":
-            value = QFileDialog.getExistingDirectory(self, "Output folder", edit.text())
-        else:
-            value, _ = QFileDialog.getOpenFileName(self, "Choose file", edit.text())
-        if value:
-            edit.setText(value)
+        def path_row(key, label, mode):
+            e = QLineEdit(defaults.get(key, ""))
+            b = QPushButton("Browse…")
+            b.setFocusPolicy(NOFOCUS)
+
+            def browse():
+                if mode == "dir":
+                    p = QFileDialog.getExistingDirectory(self, label, e.text() or "")
+                else:
+                    p, _ = QFileDialog.getOpenFileName(self, label, os.path.dirname(e.text()) if e.text() else "")
+                if p:
+                    e.setText(p)
+            b.clicked.connect(browse)
+            row = QHBoxLayout()
+            row.addWidget(e)
+            row.addWidget(b)
+            form.addRow(label, row)
+            self.f[key] = e
+
+        def text_row(key, label, default=""):
+            e = QLineEdit(defaults.get(key) or default)
+            form.addRow(label, e)
+            self.f[key] = e
+
+        path_row("movie", "Movie (optional)", "file")
+        path_row("subs", "Subtitle – language 1", "file")
+        path_row("subs2", "Subtitle – language 2 (optional)", "file")
+        text_row("lang1", "Language 1 code", "fa")
+        text_row("lang2", "Language 2 code", "en")
+        text_row("annotator", "Annotator name", "annotator1")
+        text_row("encoding", "Encoding (blank = auto)")
+        path_row("schema", "Task template (optional)", "file")
+        path_row("outdir", "Output folder (optional)", "dir")
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
 
     def values(self):
-        return {key: edit.text().strip() for key, edit in self.fields.items()}
+        return {k: e.text().strip() for k, e in self.f.items()}
 
 
-class CharacterRow(QWidget):
-    def __init__(self, task, names, on_change, on_delete, value=None):
-        super().__init__()
-        self.task, self.on_change = task, on_change
-        value = value or {}
-        box = QVBoxLayout(self)
-        box.setContentsMargins(8, 5, 8, 5)
-        top = QHBoxLayout()
-        self.name = QLineEdit(value.get("character", ""))
-        self.name.setPlaceholderText("Character")
-        self.name.setCompleter(QCompleter(sorted(names)))
-        self.name.textChanged.connect(on_change)
-        top.addWidget(self.name)
-        top.addWidget(button("Delete", lambda: on_delete(self)))
-        box.addLayout(top)
-        self.labels = LabelButtons(task, value.get("label", ""), on_change)
-        box.addWidget(self.labels)
-        self.rationale = QTextEdit(value.get("rationale", ""))
-        self.rationale.setPlaceholderText("Why this label?")
-        self.rationale.setMaximumHeight(70)
-        option = self.rationale.document().defaultTextOption()
-        option.setTextDirection(Qt.LayoutDirection.LayoutDirectionAuto)
-        self.rationale.document().setDefaultTextOption(option)
-        self.rationale.textChanged.connect(on_change)
-        box.addWidget(self.rationale)
-
-    def value(self):
-        return {"character": self.name.text(), "label": self.labels.value(), "rationale": self.rationale.toPlainText()}
-
-
-class LabelButtons(QWidget):
-    def __init__(self, task, selected, on_change):
-        super().__init__()
-        self.task, self.on_change = task, on_change
-        self.selected = selected if task["multi"] and isinstance(selected, list) else (selected or ([] if task["multi"] else ""))
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.buttons = []
-        for i, label in enumerate(task["labels"]):
-            btn = button(f"{i+1} {label['value']}", lambda _, v=label["value"]: self.toggle(v))
-            btn.setToolTip(label["hint"])
-            btn.setCheckable(True)
-            btn.setStyleSheet(f"QPushButton:checked {{ background: {label['color']}; color: white; }}")
-            layout.addWidget(btn)
-            self.buttons.append(btn)
-        layout.addStretch()
-        self.refresh()
-
-    def toggle(self, value):
-        if self.task["multi"]:
-            current = set(self.selected)
-            current.symmetric_difference_update({value})
-            self.selected = [x["value"] for x in self.task["labels"] if x["value"] in current]
-        else:
-            self.selected = "" if self.selected == value else value
-        self.refresh()
-        self.on_change()
-
-    def refresh(self):
-        for btn, label in zip(self.buttons, self.task["labels"]):
-            btn.setChecked(label["value"] in self.selected if self.task["multi"] else label["value"] == self.selected)
-
-    def value(self):
-        return self.selected
-
-
-class TaskCard(QWidget):
-    def __init__(self, task, names, on_change, activate):
-        super().__init__()
-        self.task, self.names, self.on_change = task, names, on_change
-        self.activate = activate
-        self.rows = []
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        title = QLabel(f"{task['code']} · {task['name']}")
-        title.setStyleSheet("font-weight: bold; font-size: 14px")
-        layout.addWidget(title)
-        layout.addWidget(QLabel(task["description"]))
-        if task["per_character"]:
-            self.rows_layout = QVBoxLayout()
-            layout.addLayout(self.rows_layout)
-            layout.addWidget(button("+ character", lambda: self.add_row()))
-        else:
-            self.labels = LabelButtons(task, "", self.changed)
-            layout.addWidget(self.labels)
-            self.rationale = QTextEdit()
-            self.rationale.setPlaceholderText("Why this label?")
-            self.rationale.setMaximumHeight(88)
-            option = self.rationale.document().defaultTextOption()
-            option.setTextDirection(Qt.LayoutDirection.LayoutDirectionAuto)
-            self.rationale.document().setDefaultTextOption(option)
-            self.rationale.textChanged.connect(self.changed)
-            layout.addWidget(self.rationale)
-        self.setStyleSheet("TaskCard { border: 2px solid #d7dce2; border-radius: 7px; }")
-
-    def changed(self):
-        self.activate(self.task["id"])
-        self.on_change()
-
-    def mousePressEvent(self, event):
-        self.activate(self.task["id"])
-        super().mousePressEvent(event)
-
-    def add_row(self, value=None):
-        row = CharacterRow(self.task, self.names, self.changed, self.delete_row, value)
-        self.rows.append(row)
-        self.rows_layout.addWidget(row)
-        self.changed()
-        return row
-
-    def delete_row(self, row):
-        self.rows.remove(row)
-        row.deleteLater()
-        self.changed()
-
-    def set_value(self, value):
-        if self.task["per_character"]:
-            for row in self.rows:
-                row.deleteLater()
-            self.rows.clear()
-            for entry in value or []:
-                self.add_row(entry)
-        else:
-            value = value or {}
-            self.labels.selected = value.get("label", [] if self.task["multi"] else "")
-            self.labels.refresh()
-            self.rationale.setPlainText(value.get("rationale", ""))
-
-    def value(self):
-        if self.task["per_character"]:
-            return [row.value() for row in self.rows]
-        return {"label": self.labels.value(), "rationale": self.rationale.toPlainText()}
-
-    def focus_rationale(self):
-        if self.task["per_character"]:
-            if not self.rows:
-                self.add_row()
-            self.rows[-1].rationale.setFocus()
-        else:
-            self.rationale.setFocus()
-
-    def pick(self, index):
-        if index >= len(self.task["labels"]):
-            return
-        if self.task["per_character"]:
-            if not self.rows:
-                self.add_row()
-            self.rows[-1].labels.toggle(self.task["labels"][index]["value"])
-        else:
-            self.labels.toggle(self.task["labels"][index]["value"])
-
-    def highlight(self, active, warning):
-        color = "#d58a27" if warning else "#4d83bd" if active else "#d7dce2"
-        self.setStyleSheet(f"TaskCard {{ border: 2px solid {color}; border-radius: 7px; }}")
-
-
+# --------------------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
-    def __init__(self, initial=None):
+    def __init__(self):
         super().__init__()
+        apply_theme()
+        self.P = None
+        self.cur = -1
+        self.active = 0
+        self.dirty = False
+        self.loading = False
+        self.sync = False
+        self.play_idx = -1
+        self.play_until = None
+        self.view = "both"
+        self.starts = []
+        self.rows = []
+        self.cards = []
+        self.char_model = QStringListModel()
+        self.save_timer = QTimer(self, singleShot=True, interval=450)
+        self.save_timer.timeout.connect(self.save_now)
         self.setWindowTitle("Screenplay Annotator")
-        self.resize(1350, 850)
-        self.project = None
-        self.index = -1
-        self.loading = False
-        self.active_task = ""
-        self.play_line_end = None
-        self.follow = True
-        self.mode = "both"
-        self.include_unannotated = False
-        self.timer = QTimer(self)
-        self.timer.setSingleShot(True)
-        self.timer.setInterval(450)
-        self.timer.timeout.connect(self.flush)
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.player.positionChanged.connect(self.position_changed)
-        self.player.durationChanged.connect(lambda d: self.seek.setMaximum(d))
-        self.player.errorOccurred.connect(lambda *_: self.video_message.setText("Video playback unavailable. You can keep annotating."))
-        self.build_ui()
-        self.shortcuts()
-        if initial and initial.get("subs"):
-            self.open_values(initial)
-        else:
-            QTimer.singleShot(0, self.open_dialog)
+        self.resize(1280, 820)
+        self._build_ui()
+        self._build_menu()
+        self._build_shortcuts()
+        self._build_toolbar()
 
-    def build_ui(self):
-        file_menu = self.menuBar().addMenu("File")
-        self.action(file_menu, "Open…", self.open_dialog)
-        for fmt in ("jsonl", "json", "csv"):
-            self.action(file_menu, "Export " + fmt.upper(), lambda _=False, f=fmt: self.export(f))
-        toggle = self.action(file_menu, "Include unannotated lines", self.toggle_export, check=True)
-        toggle.setChecked(False)
-        self.action(file_menu, "Quit", self.close)
-        view = self.menuBar().addMenu("View")
-        for mode, label in (("both", "Both languages"), ("one", "Language 1 only"), ("two", "Language 2 only")):
-            self.action(view, label, lambda _=False, m=mode: self.set_mode(m))
-        follow = self.action(view, "Follow video", lambda checked: setattr(self, "follow", checked), check=True)
-        follow.setChecked(True)
-        help_menu = self.menuBar().addMenu("Help")
-        self.action(help_menu, "Shortcuts", lambda: QMessageBox.information(self, "Shortcuts", "J/Down next · K/Up previous · N next unannotated · Space play/pause · P play line · T next task · 1–9 label · R rationale · Esc leave editor"))
-        splitter = QSplitter()
-        self.setCentralWidget(splitter)
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left = QWidget()
-        self.left_layout = QVBoxLayout(left)
-        left_scroll.setWidget(left)
-        splitter.addWidget(left_scroll)
-        self.video = QVideoWidget()
-        self.video.setMinimumHeight(220)
-        self.player.setVideoOutput(self.video)
-        self.left_layout.addWidget(self.video)
-        self.video_message = QLabel("No movie loaded — subtitle annotation is ready.")
-        self.left_layout.addWidget(self.video_message)
-        controls = QHBoxLayout()
-        controls.addWidget(button("▶ / ❚❚", self.play_pause))
-        self.seek = QSlider(Qt.Orientation.Horizontal)
-        self.seek.sliderMoved.connect(self.player.setPosition)
-        controls.addWidget(self.seek, 1)
-        self.clock = QLabel("00:00:00.000")
-        controls.addWidget(self.clock)
-        volume = QSlider(Qt.Orientation.Horizontal)
-        volume.setRange(0, 100)
-        volume.setValue(70)
-        volume.setMaximumWidth(90)
-        volume.valueChanged.connect(lambda n: self.audio.setVolume(n/100))
-        controls.addWidget(volume)
-        self.left_layout.addLayout(controls)
-        self.caption = QLabel("")
+    # ---- UI construction
+    def _build_ui(self):
+        # left: video + current line + task cards
+        self.video = self.player = self.audio = None       # created on demand in _ensure_player()
+        self.btn_play = QPushButton("Play")
+        self.btn_play.setToolTip("Play / pause video (Space)")
+        self.btn_play.setFixedWidth(64)
+        self.btn_play.setFocusPolicy(NOFOCUS)
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setFocusPolicy(NOFOCUS)
+        self.slider.sliderMoved.connect(lambda v: self.player and self.player.setPosition(v))
+        self.tlabel = QLabel("0:00")
+        vol = QSlider(Qt.Orientation.Horizontal)
+        vol.setRange(0, 100)
+        vol.setValue(80)
+        vol.setFixedWidth(80)
+        vol.setFocusPolicy(NOFOCUS)
+        vol.valueChanged.connect(lambda v: self.audio and self.audio.setVolume(v / 100))
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        for w in (self.btn_play, self.slider, self.tlabel, QLabel("Vol"), vol):
+            ctrl.addWidget(w)
+        self.ctrl_w = QWidget()
+        self.ctrl_w.setLayout(ctrl)
+        self.vmsg = QLabel()
+        self.vmsg.setStyleSheet("color:%s" % GREY)
+        self.vmsg.setWordWrap(True)
+        self.caption = QLabel()
+        self.caption.setTextFormat(Qt.TextFormat.RichText)
         self.caption.setWordWrap(True)
-        self.left_layout.addWidget(self.caption)
-        self.current = QLabel("Open a subtitle file to begin")
-        self.current.setWordWrap(True)
-        self.current.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.current.setStyleSheet("font-size: 16px; padding: 12px; background: #f2f4f7")
-        self.left_layout.addWidget(self.current)
-        nav = QHBoxLayout()
-        nav.addWidget(button("◀ Previous", lambda: self.select(self.index-1)))
-        nav.addWidget(button("▶ Play line", self.play_line))
-        nav.addWidget(button("Next ▶|", lambda: self.select(self.index+1)))
-        self.left_layout.addLayout(nav)
-        self.cards_box = QVBoxLayout()
-        self.left_layout.addLayout(self.cards_box)
-        self.left_layout.addStretch()
+        self.caption.setMinimumHeight(48)
+        self.caption.setStyleSheet("font-size:15px;")
+        vbox = QWidget()
+        vl = QVBoxLayout(vbox)
+        vl.setContentsMargins(0, 0, 0, 0)
+        self.vl = vl
+        vl.addWidget(self.ctrl_w)
+        vl.addWidget(self.vmsg)
+        vl.addWidget(self.caption)
+        vl.addStretch(1)
+
+        self.curlabel = QLabel()
+        self.curlabel.setTextFormat(Qt.TextFormat.RichText)
+        self.curlabel.setWordWrap(True)
+        self.curlabel.setStyleSheet("font-size:15px;")
+        self.curlabel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.curhead = QLabel()
+        b_prev, b_play, b_next = QPushButton("Previous"), QPushButton("Play line"), QPushButton("Next")
+        self.line_play = b_play
+        for b, fn in ((b_prev, lambda: self.move(-1)), (b_play, self.play_line), (b_next, lambda: self.move(1))):
+            b.setFocusPolicy(NOFOCUS)
+            b.clicked.connect(fn)
+        head = QHBoxLayout()
+        head.addWidget(self.curhead, 1)
+        for b in (b_prev, b_play, b_next):
+            head.addWidget(b)
+        cur = QFrame()
+        cur.setObjectName("currentLine")
+        cur.setFrameShape(QFrame.Shape.StyledPanel)
+        cl = QVBoxLayout(cur)
+        cl.addLayout(head)
+        cl.addWidget(self.curlabel)
+
+        # Keep media, selected dialogue, and the line queue together.
+        left = QWidget()
+        ml = QVBoxLayout(left)
+        ml.setContentsMargins(0, 0, 6, 0)
+        ml.setSpacing(8)
+        title = QLabel("Dialogue & context")
+        title.setObjectName("sectionTitle")
+        ml.addWidget(title)
+        vbox.setMaximumHeight(240)
+        ml.addWidget(vbox)
+        ml.addWidget(cur)
+        self.context = QLabel()
+        self.context.setObjectName("muted")
+        self.context.setWordWrap(True)
+        self.context.setMaximumHeight(64)
+        ml.addWidget(self.context)
+
+        # right: filters + list
+        self.f_q = QLineEdit()
+        self.f_q.setPlaceholderText("Search text / rationale / character…")
+        self.f_q.setClearButtonEnabled(True)
+        self.f_status = QComboBox()
+        for lab, key in (("All lines", "all"), ("Annotated", "annotated"), ("Unannotated", "unannotated"), ("Incomplete", "incomplete")):
+            self.f_status.addItem(lab, key)
+        self.f_task = QComboBox()
+        self.f_label = QComboBox()
+        self.f_q.textChanged.connect(self.apply_filters)
+        self.f_status.currentIndexChanged.connect(self.apply_filters)
+        self.f_task.currentIndexChanged.connect(self.on_task_filter)
+        self.f_label.currentIndexChanged.connect(self.apply_filters)
+        ml.addWidget(self.f_q)
+        fl = QHBoxLayout()
+        for w in (self.f_status, self.f_task, self.f_label):
+            w.setMinimumWidth(80)
+            w.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            fl.addWidget(w, 1)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["#", "Time", "Language 1", "Language 2", "Labels"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        hd = self.tree.header()
+        hd.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hd.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hd.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hd.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hd.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.tree.setColumnWidth(4, 145)
+        self.tree.currentItemChanged.connect(self.on_tree_current)
+        ml.addLayout(fl)
+        ml.addWidget(self.tree, 1)
+        self.queue_count = QLabel()
+        self.queue_count.setObjectName("muted")
+        ml.addWidget(self.queue_count)
+
         right = QWidget()
-        right_layout = QVBoxLayout(right)
-        filters = QHBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Search text, rationale, character")
-        self.search.textChanged.connect(self.filter_rows)
-        filters.addWidget(self.search)
-        self.status_filter = QComboBox()
-        self.status_filter.addItems(["All", "Annotated", "Unannotated", "Incomplete"])
-        self.status_filter.currentIndexChanged.connect(self.filter_rows)
-        filters.addWidget(self.status_filter)
-        self.task_filter = QComboBox()
-        self.task_filter.currentIndexChanged.connect(self.update_label_filter)
-        filters.addWidget(self.task_filter)
-        self.label_filter = QComboBox()
-        self.label_filter.currentIndexChanged.connect(self.filter_rows)
-        filters.addWidget(self.label_filter)
-        right_layout.addLayout(filters)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["#", "Time", "Language 1", "Language 2", "Labels"])
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 50)
-        self.table.setColumnWidth(1, 105)
-        self.table.setColumnWidth(2, 230)
-        self.table.setColumnWidth(3, 230)
-        self.table.setColumnWidth(4, 210)
-        self.table.cellClicked.connect(lambda row, _: self.select(row))
-        right_layout.addWidget(self.table)
-        splitter.addWidget(right)
-        splitter.setSizes([700, 650])
-        self.statusBar().showMessage("No project")
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(6, 0, 0, 0)
+        self.annotation_title = QLabel("Annotate this line")
+        self.annotation_title.setObjectName("sectionTitle")
+        rl.addWidget(self.annotation_title)
+        self.project_info = QLabel("Open subtitles to begin. Use a task template for your own labels.")
+        self.project_info.setObjectName("muted")
+        self.project_info.setWordWrap(True)
+        rl.addWidget(self.project_info)
+        self.task_list = QListWidget()
+        self.task_list.setMaximumHeight(136)
+        self.task_list.setMinimumHeight(90)
+        self.task_list.currentRowChanged.connect(self.set_active)
+        rl.addWidget(self.task_list)
+        self.cards_stack = QStackedWidget()
+        rl.addWidget(self.cards_stack, 1)
+        self.task_progress = QLabel()
+        self.task_progress.setObjectName("muted")
+        rl.addWidget(self.task_progress)
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(6)
+        self.progress.setTextVisible(False)
+        rl.addWidget(self.progress)
+        self.task_hint = QLabel()
+        self.task_hint.setWordWrap(True)
+        self.task_hint.setObjectName("muted")
+        rl.addWidget(self.task_hint)
+        actions = QHBoxLayout()
+        next_task = QPushButton("Next task (T)")
+        next_task.clicked.connect(lambda: self.set_active((self.active + 1) % max(1, len(self.cards))))
+        self.next_pending = QPushButton("Next pending line (N)")
+        self.next_pending.setObjectName("primary")
+        self.next_pending.clicked.connect(self.next_todo)
+        actions.addWidget(next_task)
+        actions.addWidget(self.next_pending)
+        rl.addLayout(actions)
 
-    def action(self, menu, title, callback, check=False):
-        action = QAction(title, self)
-        action.setCheckable(check)
-        action.triggered.connect(callback)
-        menu.addAction(action)
-        return action
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([690, 550])
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(14, 12, 14, 8)
+        shell_layout.addWidget(split)
+        self.setCentralWidget(shell)
+        self.stats = QLabel()
+        self.saved = QLabel()
+        self.statusBar().addWidget(self.stats, 1)
+        self.statusBar().addPermanentWidget(self.saved)
 
+    def _build_menu(self):
+        mb = self.menuBar()
+        fm = mb.addMenu("&File")
+        a = fm.addAction("Open…")
+        a.setShortcut(QKeySequence.StandardKey.Open)
+        a.triggered.connect(self.open_dialog)
+        fm.addSeparator()
+        self.act_all = QAction("Include unannotated lines in export", self, checkable=True)
+        fm.addAction(self.act_all)
+        for f, lab in (("jsonl", "Export JSONL…"), ("json", "Export JSON…"), ("csv", "Export CSV…")):
+            fm.addAction(lab).triggered.connect(lambda _=False, f=f: self.export(f))
+        fm.addSeparator()
+        fm.addAction("Quit").triggered.connect(self.close)
+        vm = mb.addMenu("&View")
+        grp = QActionGroup(self)
+        self.view_acts = {}
+        for key, lab in (("both", "Both languages"), ("a", "Language 1 only"), ("b", "Language 2 only")):
+            act = QAction(lab, self, checkable=True)
+            act.setChecked(key == "both")
+            act.triggered.connect(lambda _=False, k=key: self.set_view(k))
+            grp.addAction(act)
+            vm.addAction(act)
+            self.view_acts[key] = act
+        vm.addSeparator()
+        self.act_follow = QAction("Follow video", self, checkable=True)
+        self.act_follow.setChecked(True)
+        vm.addAction(self.act_follow)
+        mb.addMenu("&Help").addAction("Shortcuts").triggered.connect(self.show_help)
+
+    def _build_shortcuts(self):
+        self.single_shortcuts = []
+        def sc(key, fn):
+            shortcut = QShortcut(QKeySequence(key), self, activated=fn)
+            if len(key) == 1 or key == "Space":
+                self.single_shortcuts.append(shortcut)
+        sc("J", lambda: self.move(1))
+        sc("K", lambda: self.move(-1))
+        sc("Ctrl+Down", lambda: self.move(1))
+        sc("Ctrl+Up", lambda: self.move(-1))
+        sc("N", self.next_todo)
+        sc("Space", self.toggle_play)
+        sc("Ctrl+Space", self.toggle_play)
+        sc("P", self.play_line)
+        sc("T", lambda: self.set_active((self.active + 1) % max(1, len(self.cards))))
+        sc("R", lambda: self.cards and self.cards[self.active].focus_rationale())
+        sc("Esc", lambda: self.focusWidget() and self.focusWidget().clearFocus())
+        for k in range(1, 10):
+            sc(str(k), lambda k=k: self.pick(k - 1))
+        QApplication.instance().focusChanged.connect(self._typing_focus)
+
+    def _typing_focus(self, _old, new):
+        typing = isinstance(new, (QLineEdit, QPlainTextEdit, QComboBox))
+        for shortcut in self.single_shortcuts:
+            shortcut.setEnabled(not typing)
+
+    def _build_toolbar(self):
+        bar = QToolBar("Project", self)
+        bar.setMovable(False)
+        self.addToolBar(bar)
+        bar.addAction("Open project…", self.open_dialog)
+        bar.addAction("Create task template…", self.create_template)
+        bar.addSeparator()
+        bar.addAction("Export JSONL…", lambda: self.export("jsonl"))
+        bar.addAction("Export CSV…", lambda: self.export("csv"))
+        space = QWidget()
+        space.setSizePolicy(space.sizePolicy().Policy.Expanding, space.sizePolicy().Policy.Preferred)
+        bar.addWidget(space)
+        bar.addAction(self.act_follow)
+        bar.addAction("Shortcuts", self.show_help)
+
+    def create_template(self):
+        dlg = TemplateDialog(self)
+        if dlg.exec():
+            path, _ = QFileDialog.getSaveFileName(self, "Save task template", "annotation-tasks.json", "JSON (*.json)")
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(dlg.schema(), f, ensure_ascii=False, indent=2)
+                self.statusBar().showMessage("Template saved. Select it under Task template when opening a project.", 10000)
+
+    def show_help(self):
+        QMessageBox.information(self, "Shortcuts",
+            "J / Ctrl+Down  next line     K / Ctrl+Up  previous line\nN  next pending line for the selected task\n"
+            "Space  play / pause     P  play the selected line only\nT  switch active task\n"
+            "1-9  pick a label in the active task (again = clear)\nR  write the rationale of the active task\n"
+            "Esc  leave a text box\n\nSingle-key shortcuts do not fire while you type in a text box.\n"
+            "Everything autosaves. Labels without a rationale are marked incomplete.")
+
+    # ---- project loading
     def open_dialog(self):
-        values = self.last_values()
-        if self.project:
-            values.update({"movie": self.project.movie, "subs": self.project.subs, "subs2": self.project.subs2,
-                           "lang1": self.project.lang1, "lang2": self.project.lang2, "annotator": self.project.annotator,
-                           "outdir": str(self.project.path.parent)})
-        dialog = OpenDialog(self, values)
-        if dialog.exec():
-            self.open_values(dialog.values())
+        self.save_now()
+        if self.dirty:
+            return False
+        dlg = OpenDialog(self, core.load_prefs() if not self.P else self.P.cfg)
+        while dlg.exec():
+            try:
+                P = core.Project(dlg.values())
+            except (ValueError, OSError, KeyError) as e:
+                QMessageBox.warning(self, "Cannot open", str(e))
+                continue
+            core.save_prefs(P.cfg)
+            self.set_project(P)
+            return True
+        return False
 
-    def last_values(self):
+    def _ensure_player(self):
+        if self.player is not None or not HAS_MM:
+            return self.player is not None
         try:
-            return json.loads(SETTINGS.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {"lang1": "fa", "lang2": "en", "annotator": "annotator-a"}
+            self.video = QVideoWidget()
+            self.video.setMinimumHeight(120)
+            self.player = QMediaPlayer(self)
+            if QMediaDevices.audioOutputs():           # no sound device -> play silently
+                self.audio = QAudioOutput(self)
+                self.audio.setVolume(0.8)
+                self.player.setAudioOutput(self.audio)
+            self.player.setVideoOutput(self.video)
+        except Exception as e:                         # multimedia backend unusable on this machine
+            self.player = self.video = None
+            self.vmsg.setText("Video unavailable (%s) - labeling still works." % e)
+            return False
+        self.player.positionChanged.connect(self.on_position)
+        self.player.durationChanged.connect(lambda d: self.slider.setRange(0, d))
+        self.player.errorOccurred.connect(lambda e, msg: self.vmsg.setText("Video error: %s (continuing without video)" % msg))
+        self.player.playbackStateChanged.connect(lambda s: self.btn_play.setText("Pause" if s == QMediaPlayer.PlaybackState.PlayingState else "Play"))
+        self.vl.insertWidget(0, self.video, 1)
+        return True
 
-    def open_values(self, values):
-        self.flush()
-        try:
-            project = core.Project(**{key: values.get(key, "") for key in ("subs", "subs2", "movie", "lang1", "lang2", "annotator", "encoding")},
-                                   schema_path=values.get("schema", ""), outdir=values.get("outdir", ""))
-        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            QMessageBox.critical(self, "Could not open project", str(exc))
+    def has_video(self):
+        return self.player is not None and bool(self.P and self.P.cfg["movie"])
+
+    def set_project(self, P):
+        self.save_now()
+        if self.dirty:
             return
-        self.project = project
-        core.atomic_json(SETTINGS, values)
-        self.player.stop()
-        self.video_message.setText("" if project.movie else "No movie loaded — subtitle annotation is ready.")
-        self.player.setSource(QUrl.fromLocalFile(str(Path(project.movie).resolve())) if project.movie else QUrl())
-        self.task_filter.blockSignals(True)
-        self.task_filter.clear()
-        self.task_filter.addItem("All tasks", "")
-        for task in project.schema["tasks"]:
-            self.task_filter.addItem(task["code"], task["id"])
-        self.task_filter.blockSignals(False)
-        self.update_label_filter()
-        self.active_task = project.schema["tasks"][0]["id"]
-        self.rebuild_cards()
-        self.populate_table()
-        self.select(0)
-        if project.stale:
-            QMessageBox.warning(self, "Changed subtitles", f"{len(project.stale)} saved line UID(s) do not match these subtitles. Matching lines remain available.")
+        self.P = P
+        self.cur, self.active, self.play_idx = -1, 0, -1
+        self.starts = [l["start"] for l in P.lines]
+        c = P.cfg
+        self.setWindowTitle("Screenplay Annotator – %s – %s" % (os.path.basename(c["movie"] or c["subs"]), c["annotator"]))
+        # cards
+        self.task_list.blockSignals(True)
+        self.task_list.clear()
+        while self.cards_stack.count():
+            page = self.cards_stack.widget(0)
+            self.cards_stack.removeWidget(page)
+            page.deleteLater()
+        self.cards = []
+        for i, t in enumerate(P.schema["tasks"]):
+            card = TaskCard(t, i, self.char_model)
+            card.changed.connect(self.on_card_changed)
+            card.focused.connect(lambda cd: self.set_active(cd.idx))
+            holder = QWidget()
+            layout = QVBoxLayout(holder)
+            layout.setContentsMargins(0, 0, 4, 0)
+            layout.addWidget(card)
+            layout.addStretch(1)
+            page = QScrollArea()
+            page.setWidgetResizable(True)
+            page.setWidget(holder)
+            self.cards_stack.addWidget(page)
+            item = QListWidgetItem(t["name"])
+            item.setSizeHint(QSize(0, 32))
+            self.task_list.addItem(item)
+            self.cards.append(card)
+        self.task_list.setCurrentRow(0)
+        self.task_list.blockSignals(False)
+        self.cards_stack.setCurrentIndex(0)
+        self.project_info.setText("%s  ·  %s" % (P.schema["name"], c["annotator"]))
+        self.project_info.setToolTip("Working file: " + P.path)
+        # filters
+        self.f_task.blockSignals(True)
+        self.f_task.clear()
+        self.f_task.addItem("any task", "")
+        for t in P.schema["tasks"]:
+            self.f_task.addItem(t["name"], t["id"])
+        self.f_task.blockSignals(False)
+        self.on_task_filter(apply=False)
+        # list
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        self.rows = []
+        for i, L in enumerate(P.lines):
+            it = QTreeWidgetItem([str(L["id"]), fmt(L["start"]), cell(L["t1"]), cell(L["t2"]), ""])
+            for col, txt in ((2, L["t1"]), (3, L["t2"])):
+                it.setTextAlignment(col, (Qt.AlignmentFlag.AlignRight if is_rtl(txt) else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter)
+            self.tree.addTopLevelItem(it)
+            self.rows.append(it)
+            self.refresh_row(i)
+        self.tree.blockSignals(False)
+        has2 = bool(c["subs2"])
+        for k in ("a", "b"):
+            self.view_acts[k].setEnabled(has2)
+        self.view_acts["both"].setChecked(True)
+        self.set_view("both")
+        # video
+        has_v = bool(c["movie"]) and self._ensure_player()
+        if self.player:
+            self.player.stop()
+            self.player.setSource(QUrl.fromLocalFile(c["movie"]) if has_v else QUrl())
+            self.video.setVisible(has_v)
+        self.ctrl_w.setVisible(has_v)
+        self.line_play.setEnabled(has_v)
+        self.caption.setVisible(has_v)
+        self.act_follow.setEnabled(has_v)
+        if has_v:
+            self.vmsg.setText("")
+        elif not c["movie"]:
+            self.vmsg.setText("No movie loaded – subtitles only (viewer / edit mode).")
+        elif not HAS_MM:
+            self.vmsg.setText("Qt Multimedia not available (pip install PySide6) – subtitles only.")
+        self.rebuild_chars()
+        self.update_stats()
+        self.saved.setText("autosave → " + os.path.basename(P.path))
+        if P.warnings:
+            QMessageBox.warning(self, "Please review", "\n".join(P.warnings))
+        self.select_line(self.first_todo(), seek=True)
+        self.apply_filters()
 
-    def rebuild_cards(self):
-        while self.cards_box.count():
-            item = self.cards_box.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        names = {entry.get("character", "") for ann in self.project.annotations.values() for task in self.project.schema["tasks"] if task["per_character"] for entry in ann.get(task["id"], [])}
-        self.cards = {}
-        for task in self.project.schema["tasks"]:
-            card = TaskCard(task, names - {""}, self.edited, self.activate_task)
-            self.cards_box.addWidget(card)
-            self.cards[task["id"]] = card
+    # ---- list rows / filters
+    def chips(self, i):
+        L = self.P.lines[i]
+        tasks = self.P.items.get(L["id"], {}).get("tasks", {})
+        parts, tips, color, inc = [], [], None, False
+        for t in self.P.schema["tasks"]:
+            e = tasks.get(t["id"])
+            if core.entry_state(t, e) == "empty":
+                continue
+            for r in (e if t["per_character"] else [e]):
+                labs = r["label"] if isinstance(r["label"], list) else ([r["label"]] if r["label"] else ["?"])
+                bad = not r["label"] or (t["rationale"] == "required" and not r["rationale"].strip()) or (t["per_character"] and not r["character"].strip())
+                inc |= bad
+                who = (r.get("character", "") + ": ") if r.get("character") else ""
+                parts.append(("⚠" if bad else "") + "%s·%s%s" % (t["short"], who, "/".join(labs)))
+                tips.append("%s – %s: %s%s" % (t["name"], who + "/".join(labs), r["rationale"] or "(no rationale)", "" if not bad else "   [incomplete]"))
+                if color is None and r["label"]:
+                    first = r["label"][0] if isinstance(r["label"], list) else r["label"]
+                    color = next((l["color"] for l in t["labels"] if l["value"] == first), None)
+        return "  ".join(parts), "\n".join(tips), color, inc
 
-    def populate_table(self):
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(self.project.lines))
-        for row, line in enumerate(self.project.lines):
-            for col, text in enumerate((str(line["id"]), timecode(line["start"]), line["text1"], line["text2"], "")):
-                item = QTableWidgetItem(text.replace("\n", " / "))
-                item.setTextAlignment((Qt.AlignmentFlag.AlignRight if direction(text) == Qt.LayoutDirection.RightToLeft else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(row, col, item)
-            self.refresh_row(row, update_status=False)
-        self.table.blockSignals(False)
-        self.update_status()
-
-    def annotation_summary(self, ann):
-        parts, rationales = [], []
-        for task in self.project.schema["tasks"]:
-            value = ann.get(task["id"])
-            for entry in (value if task["per_character"] else [value]) if value else []:
-                label = entry.get("label")
-                if label:
-                    parts.append(task["code"] + "·" + (entry.get("character", "") + ":" if task["per_character"] else "") + (", ".join(label) if isinstance(label, list) else label))
-                if entry.get("rationale"):
-                    rationales.append(task["name"] + ": " + entry["rationale"])
-        return "  ".join(parts), "\n".join(rationales)
-
-    def refresh_row(self, row, update_status=True):
-        line = self.project.lines[row]
-        ann = self.project.annotations.get(line["uid"], {})
-        summary, tooltip = self.annotation_summary(ann)
-        warning = core.incomplete(ann, self.project.schema)
-        self.table.item(row, 4).setText(("⚠ " if warning else "") + summary)
-        self.table.item(row, 4).setForeground(QColor("#30343a"))
-        for task in self.project.schema["tasks"]:
-            value = ann.get(task["id"])
-            if value:
-                entry = value[0] if task["per_character"] else value
-                selected = entry.get("label")
-                if isinstance(selected, list):
-                    selected = selected[0] if selected else ""
-                color = next((label["color"] for label in task["labels"] if label["value"] == selected), None)
-                if color:
-                    self.table.item(row, 4).setForeground(QColor(color))
-                    break
+    def refresh_row(self, i):
+        txt, tip, color, inc = self.chips(i)
+        it = self.rows[i]
+        it.setText(4, txt)
+        it.setToolTip(4, tip)
+        it.setForeground(4, QBrush(QColor("#875000" if inc else "#334966")))
+        bg = QBrush(QColor("#fff3db")) if inc else QBrush()
         for col in range(5):
-            item = self.table.item(row, col)
-            item.setToolTip(tooltip)
-            item.setBackground(QColor("#fff1d9") if warning else QColor("#ffffff"))
-        if update_status:
-            self.update_status()
+            it.setBackground(col, bg)
 
-    def select(self, index, seek=True):
-        if not self.project or not 0 <= index < len(self.project.lines):
+    def on_task_filter(self, *_, apply=True):
+        tid = self.f_task.currentData()
+        self.f_label.blockSignals(True)
+        self.f_label.clear()
+        self.f_label.addItem("any label", "")
+        t = next((x for x in self.P.schema["tasks"] if x["id"] == tid), None) if self.P else None
+        for l in (t["labels"] if t else []):
+            self.f_label.addItem(l["value"], l["value"])
+        self.f_label.blockSignals(False)
+        if apply:
+            self.apply_filters()
+
+    def matches(self, i):
+        P, L = self.P, self.P.lines[i]
+        tasks = P.items.get(L["id"], {}).get("tasks", {})
+        any_, inc = core.line_state(P, L["id"])
+        st = self.f_status.currentData()
+        if (st == "annotated" and not any_) or (st == "unannotated" and any_) or (st == "incomplete" and not inc):
+            return False
+        tid, lb = self.f_task.currentData(), self.f_label.currentData()
+        if tid:
+            t = next(x for x in P.schema["tasks"] if x["id"] == tid)
+            e = tasks.get(tid)
+            if core.entry_state(t, e) == "empty":
+                return False
+            if lb:
+                rows = e if t["per_character"] else [e]
+                if not any((lb in r["label"]) if isinstance(r["label"], list) else r["label"] == lb for r in rows):
+                    return False
+        q = self.f_q.text().strip().lower()
+        if q:
+            hay = (L["t1"] + " " + L["t2"]).lower()
+            for e in tasks.values():
+                for r in (e if isinstance(e, list) else [e]):
+                    hay += " " + r["rationale"].lower() + " " + r.get("character", "").lower()
+            if q not in hay:
+                return False
+        return True
+
+    def apply_filters(self, *_):
+        if not self.P:
             return
-        if self.index != index:
-            self.flush()
-        self.index = index
-        line = self.project.lines[index]
-        if seek and self.project.movie:
-            self.player.setPosition(line["start"])
-        shown = [line["text1"]] if self.mode == "one" else [line["text2"]] if self.mode == "two" else [line["text1"], line["text2"]]
-        self.current.setText(f"#{line['id']} · {timecode(line['start'])} → {timecode(line['end'])}\n" + "\n".join(x for x in shown if x))
-        self.current.setLayoutDirection(direction(shown[0] if shown else ""))
+        for i, it in enumerate(self.rows):
+            it.setHidden(not self.matches(i))
+        visible = sum(not it.isHidden() for it in self.rows)
+        self.queue_count.setText("%d of %d lines shown" % (visible, len(self.rows)))
+
+    def rebuild_chars(self):
+        names = set()
+        for it in self.P.items.values():
+            for e in it["tasks"].values():
+                if isinstance(e, list):
+                    names.update(r["character"] for r in e if r.get("character"))
+        self.char_model.setStringList(sorted(names))
+
+    def update_stats(self):
+        a = inc = 0
+        for L in self.P.lines:
+            x, y = core.line_state(self.P, L["id"])
+            a += x
+            inc += y
+        self.stats.setText("%d / %d lines annotated%s" % (a, len(self.P.lines), " · %d incomplete" % inc if inc else ""))
+
+    # ---- view mode
+    def set_view(self, v):
+        self.view = v
+        self.tree.setColumnHidden(2, v == "b")
+        self.tree.setColumnHidden(3, v == "a" or not self.P or not self.P.cfg["subs2"])
+        self.tree.setHeaderLabels(["#", "Time", "Language 1 (%s)" % self.P.cfg["lang1"] if self.P else "Language 1",
+                                   "Language 2 (%s)" % self.P.cfg["lang2"] if self.P else "Language 2", "Labels"])
+        self.render_cur()
+        self.render_caption(self.play_idx)
+
+    def texts_html(self, L, big=False):
+        a = rich(L["t1"]) if self.view != "b" else ""
+        b = rich(L["t2"], GREY if self.view == "both" else None) if self.view != "a" else ""
+        return a + b
+
+    def render_caption(self, i):
+        self.caption.setText(self.texts_html(self.P.lines[i]) if self.P and i >= 0 else "")
+
+    def render_cur(self):
+        if not self.P or self.cur < 0:
+            self.curhead.setText("")
+            self.curlabel.setText("")
+            return
+        L = self.P.lines[self.cur]
+        self.curhead.setText("<b>#%d</b> &nbsp; %s → %s" % (L["id"], fmt(L["start"]), fmt(L["end"])))
+        self.curlabel.setText(self.texts_html(L))
+        self.annotation_title.setText("Annotate line %d of %d" % (L["id"], len(self.P.lines)))
+        context = []
+        for idx, label in ((self.cur - 1, "Before"), (self.cur + 1, "After")):
+            if 0 <= idx < len(self.P.lines):
+                neighbor = self.P.lines[idx]
+                text = neighbor["t2"] if self.view == "b" else neighbor["t1"]
+                context.append("<b>%s:</b> %s" % (label, _html.escape(text.replace("\n", " ")[:170])))
+        self.context.setText("<br>".join(context))
+
+    # ---- selection
+    def first_todo(self):
+        for i, L in enumerate(self.P.lines):
+            if not core.line_state(self.P, L["id"])[0]:
+                return i
+        return 0
+
+    def next_todo(self):
+        if not self.P or not self.cards:
+            return
+        self.save_now()
+        if self.dirty:
+            return
+        task = self.cards[self.active].task
+        n = len(self.P.lines)
+        for offset in range(1, n + 1):
+            i = (self.cur + offset) % n
+            tasks = self.P.items.get(self.P.lines[i]["id"], {}).get("tasks", {})
+            if not self.rows[i].isHidden() and core.entry_state(task, tasks.get(task["id"])) != "ok":
+                return self.select_line(i, seek=True)
+        self.statusBar().showMessage("This task is complete for all visible lines.", 6000)
+
+    def move(self, d):
+        if self.P:
+            for i in range(self.cur + d, len(self.rows) if d > 0 else -1, d):
+                if not self.rows[i].isHidden():
+                    self.select_line(i, seek=True)
+                    break
+
+    def on_tree_current(self, item, _old):
+        if item is not None and not self.sync:
+            self.select_line(self.rows.index(item), seek=True, from_tree=True)
+
+    def select_line(self, i, seek=False, from_tree=False):
+        if not self.P or not self.P.lines:
+            return
+        i = max(0, min(i, len(self.P.lines) - 1))
+        self.save_now()
+        if self.dirty:
+            if self.cur >= 0:
+                self.sync = True
+                self.tree.setCurrentItem(self.rows[self.cur])
+                self.sync = False
+            return
+        self.cur = i
+        if not from_tree:
+            self.sync = True
+            self.tree.setCurrentItem(self.rows[i])
+            self.tree.scrollToItem(self.rows[i])
+            self.sync = False
+        if seek and self.has_video():
+            self.player.setPosition(int(self.P.lines[i]["start"] * 1000))
+        self.render_cur()
+        tasks = self.P.items.get(self.P.lines[i]["id"], {}).get("tasks", {})
         self.loading = True
-        ann = self.project.annotations.get(line["uid"], {})
-        for task in self.project.schema["tasks"]:
-            self.cards[task["id"]].set_value(ann.get(task["id"]))
-            self.cards[task["id"]].highlight(task["id"] == self.active_task, core.incomplete({task["id"]: ann.get(task["id"])}, {"tasks": [task]}))
+        for card in self.cards:
+            card.load(tasks.get(card.task["id"]))
         self.loading = False
-        self.activate_task(self.active_task)
-        self.table.selectRow(index)
-        self.table.scrollToItem(self.table.item(index, 0))
+        self.update_card_styles()
 
-    def edited(self):
-        if self.loading or not self.project or self.index < 0:
-            return
-        data = {key: card.value() for key, card in self.cards.items()}
-        line = self.project.lines[self.index]
-        self.project.set_annotation(line["uid"], data)
-        self.refresh_row(self.index)
-        for task in self.project.schema["tasks"]:
-            self.cards[task["id"]].highlight(task["id"] == self.active_task,
-                core.incomplete({task["id"]: self.project.annotations.get(line["uid"], {}).get(task["id"])}, {"tasks": [task]}))
-        self.timer.start()
-        self.statusBar().showMessage(self.status_text() + " · unsaved")
+    def set_active(self, k):
+        if 0 <= k < len(self.cards):
+            self.active = k
+            self.cards_stack.setCurrentIndex(k)
+            self.task_list.blockSignals(True)
+            self.task_list.setCurrentRow(k)
+            self.task_list.blockSignals(False)
+            self.update_card_styles()
 
-    def status_text(self):
-        if not self.project:
-            return "No project"
-        annotated = sum(bool(self.project.annotations.get(line["uid"])) for line in self.project.lines)
-        incomplete = sum(core.incomplete(self.project.annotations.get(line["uid"], {}), self.project.schema) for line in self.project.lines)
-        return f"{annotated} / {len(self.project.lines)} lines annotated · {incomplete} incomplete"
+    def update_card_styles(self):
+        complete = 0
+        for k, card in enumerate(self.cards):
+            state = core.entry_state(card.task, card.collect())
+            complete += state == "ok"
+            card.refresh_style(k == self.active, state)
+            state_text = {"empty": "Not started", "ok": "Complete", "incomplete": "Needs attention"}[state]
+            item = self.task_list.item(k)
+            item.setText("%d. %s  ·  %s" % (k + 1, card.task["name"], state_text))
+            item.setToolTip(card.task["description"] + "\n" + state_text)
+        self.task_progress.setText("%d of %d tasks complete on this line" % (complete, len(self.cards)))
+        self.progress.setRange(0, max(1, len(self.cards)))
+        self.progress.setValue(complete)
+        if self.P and self.cards:
+            task = self.cards[self.active].task
+            done = sum(core.entry_state(task, self.P.items.get(line["id"], {}).get("tasks", {}).get(task["id"])) == "ok"
+                       for line in self.P.lines)
+            self.task_hint.setText("%s: %d / %d lines complete. Next pending follows the current filters." %
+                                   (task["name"], done, len(self.P.lines)))
 
-    def update_status(self):
-        self.statusBar().showMessage(self.status_text())
+    def pick(self, k):
+        if self.cards and k < len(self.cards[self.active].task["labels"]):
+            self.cards[self.active].toggle_label(k)
 
-    def flush(self):
-        if not self.project or not self.timer.isActive():
-            return
-        self.timer.stop()
-        try:
-            self.project.save()
-            from datetime import datetime
-            self.statusBar().showMessage(self.status_text() + " · saved " + datetime.now().strftime("%H:%M:%S"))
-        except OSError as exc:
-            self.statusBar().showMessage(self.status_text() + " · save failed: " + str(exc))
-            QMessageBox.critical(self, "Save failed", str(exc))
-
-    def update_label_filter(self):
-        self.label_filter.blockSignals(True)
-        self.label_filter.clear()
-        self.label_filter.addItem("All labels", "")
-        if self.project:
-            task_id = self.task_filter.currentData()
-            for task in self.project.schema["tasks"]:
-                if task["id"] == task_id:
-                    for label in task["labels"]:
-                        self.label_filter.addItem(label["value"], label["value"])
-        self.label_filter.blockSignals(False)
-        self.filter_rows()
-
-    def filter_rows(self):
-        if not self.project:
-            return
-        query = self.search.text().casefold()
-        task_id, label = self.task_filter.currentData(), self.label_filter.currentData()
-        status = self.status_filter.currentText()
-        for row, line in enumerate(self.project.lines):
-            ann = self.project.annotations.get(line["uid"], {})
-            searchable = line["text1"] + " " + line["text2"] + " " + json.dumps(ann, ensure_ascii=False)
-            matched = query in searchable.casefold()
-            matched &= status == "All" or (status == "Annotated" and bool(ann)) or (status == "Unannotated" and not ann) or (status == "Incomplete" and core.incomplete(ann, self.project.schema))
-            if task_id:
-                value = ann.get(task_id)
-                matched &= bool(value)
-                if label and value:
-                    entries = value if isinstance(value, list) else [value]
-                    matched &= any(label in entry.get("label", []) if isinstance(entry.get("label"), list) else entry.get("label") == label for entry in entries)
-            self.table.setRowHidden(row, not matched)
-
-    def activate_task(self, task_id):
+    # ---- saving
+    def on_card_changed(self, card):
         if self.loading:
             return
-        self.active_task = task_id
-        for key, card in self.cards.items():
-            value = {}
-            if self.project and self.index >= 0:
-                uid = self.project.lines[self.index]["uid"]
-                value = {key: self.project.annotations.get(uid, {}).get(key)}
-            card.highlight(key == task_id, core.incomplete(value, {"tasks": [card.task]}))
+        self.set_active(card.idx)
+        self.dirty = True
+        self.saved.setText("● editing…")
+        self.save_timer.start()
 
-    def position_changed(self, position):
-        self.seek.blockSignals(True)
-        self.seek.setValue(position)
-        self.seek.blockSignals(False)
-        self.clock.setText(timecode(position))
-        if self.play_line_end is not None and position >= self.play_line_end:
-            self.player.pause()
-            self.play_line_end = None
-        if not self.project:
+    def save_now(self):
+        self.save_timer.stop()
+        if not self.dirty or not self.P or self.cur < 0:
             return
-        match = next((i for i, line in enumerate(self.project.lines) if line["start"] <= position < line["end"]), None)
-        if match is not None:
-            line = self.project.lines[match]
-            shown = [line["text1"]] if self.mode == "one" else [line["text2"]] if self.mode == "two" else [line["text1"], line["text2"]]
-            self.caption.setText("\n".join(x for x in shown if x))
-            self.caption.setLayoutDirection(direction(shown[0] if shown else ""))
-            if self.follow and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and match != self.index and not isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit)):
-                self.select(match, seek=False)
-        else:
-            self.caption.setText("")
+        self.dirty = False
+        L = self.P.lines[self.cur]
+        try:
+            self.P.set_annotation(L["id"], {c.task["id"]: c.collect() for c in self.cards})
+        except (ValueError, OSError) as e:
+            self.dirty = True
+            self.saved.setText("<span style='color:#d64545'>Save failed: %s</span>" % e)
+            return
+        self.refresh_row(self.cur)
+        self.rebuild_chars()
+        self.update_stats()
+        self.update_card_styles()
+        self.apply_filters()
+        self.saved.setText("✓ saved %s" % datetime.now().strftime("%H:%M:%S"))
 
-    def play_pause(self):
-        if not self.project or not self.project.movie:
+    # ---- video
+    def toggle_play(self):
+        if not self.has_video():
             return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
-            self.play_line_end = None
             self.player.play()
 
     def play_line(self):
-        if self.project and self.project.movie and self.index >= 0:
-            line = self.project.lines[self.index]
-            self.player.setPosition(line["start"])
-            self.play_line_end = line["end"]
+        if self.has_video() and self.cur >= 0:
+            L = self.P.lines[self.cur]
+            self.play_until = int(L["end"] * 1000)
+            self.player.setPosition(int(L["start"] * 1000))
             self.player.play()
 
-    def toggle_export(self, checked):
-        self.include_unannotated = checked
+    def line_at(self, t):
+        a = bisect.bisect_right(self.starts, t) - 1
+        for k in range(a, max(-1, a - 4), -1):
+            if self.P.lines[k]["end"] > t:
+                return k
+        return -1
 
-    def export(self, fmt):
-        if not self.project:
+    def on_position(self, ms):
+        if not self.P:
             return
-        self.flush()
-        path, _ = QFileDialog.getSaveFileName(self, "Export " + fmt.upper(), str(self.project.path.with_suffix("." + fmt)), "All files (*)")
-        if path:
-            try:
-                self.project.export(path, fmt, self.include_unannotated)
-                self.statusBar().showMessage("Exported " + path)
-            except OSError as exc:
-                QMessageBox.critical(self, "Export failed", str(exc))
-
-    def set_mode(self, mode):
-        self.mode = mode
-        self.table.setColumnHidden(2, mode == "two")
-        self.table.setColumnHidden(3, mode == "one")
-        if self.project and self.index >= 0:
-            self.select(self.index, seek=False)
-            self.position_changed(self.player.position())
-
-    def shortcuts(self):
-        bindings = {"J": lambda: self.select(self.index+1), "Down": lambda: self.select(self.index+1),
-                    "K": lambda: self.select(self.index-1), "Up": lambda: self.select(self.index-1),
-                    "N": self.next_unannotated, "Space": self.play_pause, "P": self.play_line,
-                    "T": self.next_task, "R": self.focus_rationale}
-        for n in range(1, 10):
-            bindings[str(n)] = lambda i=n-1: self.pick_label(i)
-        for key, callback in bindings.items():
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-            shortcut.activated.connect(lambda cb=callback: self.run_shortcut(cb))
-        escape = QShortcut(QKeySequence("Escape"), self)
-        escape.activated.connect(lambda: self.setFocus())
-
-    def run_shortcut(self, callback):
-        if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit)):
+        if self.play_until is not None and ms >= self.play_until:
+            self.player.pause()
+            self.play_until = None
+        if not self.slider.isSliderDown():
+            self.slider.setValue(ms)
+        self.tlabel.setText("%s / %s" % (fmt(ms / 1000), fmt(self.player.duration() / 1000)))
+        i = self.line_at(ms / 1000)
+        if i == self.play_idx:
             return
-        callback()
+        if self.play_idx >= 0:
+            f = self.rows[self.play_idx].font(1)
+            f.setBold(False)
+            self.rows[self.play_idx].setFont(1, f)
+        self.play_idx = i
+        if i >= 0:
+            f = self.rows[i].font(1)
+            f.setBold(True)
+            self.rows[i].setFont(1, f)
+        self.render_caption(i)
+        typing = isinstance(self.focusWidget(), (QLineEdit, QPlainTextEdit)) and self.focusWidget() not in (self.f_q,)
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if i >= 0 and playing and self.act_follow.isChecked() and not typing and i != self.cur:
+            self.select_line(i, seek=False)
 
-    def next_unannotated(self):
-        if not self.project:
+    # ---- export / close
+    def export(self, fmt_):
+        if not self.P:
             return
-        for i in range(self.index+1, len(self.project.lines)):
-            if self.project.lines[i]["uid"] not in self.project.annotations:
-                self.select(i)
-                break
+        self.save_now()
+        base = os.path.splitext(os.path.basename(self.P.cfg["movie"] or self.P.cfg["subs"]))[0]
+        default = os.path.join(os.path.dirname(self.P.path), "%s.%s.%s" % (base, self.P.cfg["annotator"], fmt_))
+        path, _ = QFileDialog.getSaveFileName(self, "Export", default, "*.%s" % fmt_)
+        if not path:
+            return
+        body, _ = self.P.export(fmt_, self.act_all.isChecked())
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        self.statusBar().showMessage("Exported → %s" % path, 6000)
 
-    def next_task(self):
-        if self.project:
-            ids = [task["id"] for task in self.project.schema["tasks"]]
-            self.activate_task(ids[(ids.index(self.active_task)+1) % len(ids)])
-
-    def pick_label(self, index):
-        if self.project:
-            self.cards[self.active_task].pick(index)
-
-    def focus_rationale(self):
-        if self.project:
-            self.cards[self.active_task].focus_rationale()
-
-    def closeEvent(self, event):
-        self.flush()
-        event.accept()
+    def closeEvent(self, e):
+        self.save_now()
+        if self.dirty:
+            e.ignore()
+            return
+        if self.player:
+            self.player.stop()
+        e.accept()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Offline native screenplay annotation")
-    for flag in ("movie", "subs", "subs2", "lang1", "lang2", "annotator", "schema", "outdir", "encoding"):
-        parser.add_argument("--" + flag, default="")
-    parser.add_argument("--dump-schema", metavar="FILE")
-    args = parser.parse_args(argv)
+    ap = argparse.ArgumentParser(description="Screenplay Annotator (desktop)")
+    for a in ("movie", "subs", "subs2", "lang1", "lang2", "annotator", "schema", "outdir", "encoding"):
+        ap.add_argument("--" + a)
+    ap.add_argument("--dump-schema", metavar="FILE")
+    args = ap.parse_args(argv)
     if args.dump_schema:
-        core.atomic_json(args.dump_schema, core.DEFAULT_SCHEMA)
+        with open(args.dump_schema, "w", encoding="utf-8") as f:
+            json.dump(core.DEFAULT_SCHEMA, f, ensure_ascii=False, indent=2)
+        print("Wrote", args.dump_schema)
         return 0
     app = QApplication(sys.argv[:1])
-    app.setFont(QFont("Segoe UI", 10))
-    window = MainWindow(vars(args) if args.subs else None)
-    window.show()
+    font = app.font()
+    font.setFamilies(["Segoe UI", "Vazirmatn", "Tahoma", font.family()])
+    app.setFont(font)
+    win = MainWindow()
+    win.show()
+    if args.subs:
+        try:
+            win.set_project(core.Project(vars(args)))
+        except (ValueError, OSError) as e:
+            QMessageBox.critical(win, "Cannot open", str(e))
+            if not win.open_dialog():
+                return 1
+    elif not win.open_dialog():
+        return 0
     return app.exec()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
