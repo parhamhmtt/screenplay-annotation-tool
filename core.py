@@ -253,7 +253,7 @@ class Project:
         outdir = c["outdir"] or os.path.join(os.path.dirname(c["subs"]), "annotations")
         os.makedirs(outdir, exist_ok=True)
         base = os.path.splitext(os.path.basename(c["movie"] or c["subs"]))[0]
-        self.path = os.path.join(outdir, "%s.%s.annotations.json" % (_safe(base), _safe(c["annotator"])))
+        self.path = os.path.join(outdir, "%s.annotations.json" % _safe(base))
         self.items, self.warnings = {}, []
         self._load()
 
@@ -276,7 +276,12 @@ class Project:
                 continue
             if v.get("uid") != uids[i]:
                 stale += 1
-            self.items[i] = {"uid": uids[i], "tasks": v.get("tasks", {})}
+            self.items[i] = {
+                "uid": uids[i],
+                "tasks": v.get("tasks", {}),
+                "last_edited_by": v.get("last_edited_by", ""),
+                "last_edited_at": v.get("last_edited_at", "")
+            }
         if stale:
             self.warnings.append("%d saved annotation(s) did not match the current subtitle file "
                                  "(different file or edited text) - please review them." % stale)
@@ -332,11 +337,30 @@ class Project:
         with self.lock:
             if not 1 <= line_id <= len(self.lines):
                 raise ValueError("bad line id")
+
             clean = self.validate(tasks)
-            if clean:
-                self.items[line_id] = {"uid": self.lines[line_id - 1]["uid"], "tasks": clean}
+            previous = self.items.get(line_id, {})
+            old_tasks = previous.get("tasks", {})
+
+            if old_tasks != clean:
+                last_edited_by = self.cfg["annotator"]
+                last_edited_at = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+            else:
+                last_edited_by = previous.get("last_edited_by", "")
+                last_edited_at = previous.get("last_edited_at", "")
+
+            if clean or last_edited_at:
+                self.items[line_id] = {
+                    "uid": self.lines[line_id - 1]["uid"],
+                    "tasks": clean,
+                    "last_edited_by": last_edited_by,
+                    "last_edited_at": last_edited_at,
+                }
             else:
                 self.items.pop(line_id, None)
+
             self._write()
 
     # --- export

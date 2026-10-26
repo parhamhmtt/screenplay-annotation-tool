@@ -487,7 +487,7 @@ class OpenDialog(QDialog):
         path_row("subs2", "Subtitle – language 2 (optional)", "file")
         text_row("lang1", "Language 1 code", "fa")
         text_row("lang2", "Language 2 code", "en")
-        text_row("annotator", "Annotator name", "annotator1")
+        text_row("annotator", "Annotator name", "Model")
         text_row("encoding", "Encoding (blank = auto)")
         path_row("schema", "Task template (optional)", "file")
         path_row("outdir", "Output folder (optional)", "dir")
@@ -665,6 +665,10 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.task_list)
         self.cards_stack = QStackedWidget()
         rl.addWidget(self.cards_stack, 1)
+        self.last_edited_label = QLabel()
+        self.last_edited_label.setObjectName("muted")
+        self.last_edited_label.setWordWrap(True)
+        rl.addWidget(self.last_edited_label)
         self.task_progress = QLabel()
         self.task_progress.setObjectName("muted")
         rl.addWidget(self.task_progress)
@@ -1133,6 +1137,35 @@ class MainWindow(QMainWindow):
             card.load(tasks.get(card.task["id"]))
         self.loading = False
         self.update_card_styles()
+        self.update_last_edited_label()
+    def update_last_edited_label(self):
+        if not self.P or self.cur < 0:
+            self.last_edited_label.setText("")
+            return
+
+        line_id = self.P.lines[self.cur]["id"]
+        item = self.P.items.get(line_id, {})
+
+        username = item.get("last_edited_by", "")
+        timestamp = item.get("last_edited_at", "")
+
+        if not username:
+            self.last_edited_label.setText(
+                "Last edited by: Not edited yet"
+            )
+            return
+
+        text = f"Last edited by: {username}"
+
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                dt = dt.astimezone()
+                text += "\nLast edited: " + dt.strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                pass
+
+        self.last_edited_label.setText(text)
 
     def set_active(self, k):
         if 0 <= k < len(self.cards):
@@ -1184,6 +1217,7 @@ class MainWindow(QMainWindow):
         L = self.P.lines[self.cur]
         try:
             self.P.set_annotation(L["id"], {c.task["id"]: c.collect() for c in self.cards})
+            self.update_last_edited_label()
         except (ValueError, OSError) as e:
             self.dirty = True
             self.saved.setText("<span style='color:#d64545'>Save failed: %s</span>" % e)
