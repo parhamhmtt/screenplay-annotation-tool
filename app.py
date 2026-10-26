@@ -964,28 +964,55 @@ class MainWindow(QMainWindow):
     def matches(self, i):
         P, L = self.P, self.P.lines[i]
         tasks = P.items.get(L["id"], {}).get("tasks", {})
+
         any_, inc = core.line_state(P, L["id"])
         st = self.f_status.currentData()
-        if (st == "annotated" and not any_) or (st == "unannotated" and any_) or (st == "incomplete" and not inc):
+
+        all_complete = all(
+            core.entry_state(t, tasks.get(t["id"])) == "ok"
+            for t in P.schema["tasks"]
+        )
+
+        if st == "annotated" and not all_complete:
             return False
+
+        if st == "unannotated" and any_:
+            return False
+
+        if st == "incomplete" and (not any_ or all_complete):
+            return False
+
         tid, lb = self.f_task.currentData(), self.f_label.currentData()
+
         if tid:
             t = next(x for x in P.schema["tasks"] if x["id"] == tid)
             e = tasks.get(tid)
+
             if core.entry_state(t, e) == "empty":
                 return False
+
             if lb:
                 rows = e if t["per_character"] else [e]
-                if not any((lb in r["label"]) if isinstance(r["label"], list) else r["label"] == lb for r in rows):
+                if not any(
+                        (lb in r["label"])
+                        if isinstance(r["label"], list)
+                        else r["label"] == lb
+                        for r in rows
+                ):
                     return False
+
         q = self.f_q.text().strip().lower()
+
         if q:
             hay = (L["t1"] + " " + L["t2"]).lower()
+
             for e in tasks.values():
                 for r in (e if isinstance(e, list) else [e]):
                     hay += " " + r["rationale"].lower() + " " + r.get("character", "").lower()
+
             if q not in hay:
                 return False
+
         return True
 
     def apply_filters(self, *_):
