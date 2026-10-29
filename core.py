@@ -68,6 +68,9 @@ DEFAULT_SCHEMA = {
 }
 
 
+LINE_TYPES = ("dialogue", "description")   # "description" = scene sound / narration text, nothing to annotate
+
+
 def load_schema(path=None):
     if not path:
         return json.loads(json.dumps(DEFAULT_SCHEMA))
@@ -289,6 +292,7 @@ class Project:
             self.items[i] = {
                 "uid": uids[i],
                 "tasks": self._upgrade_tasks(v.get("tasks", {})),
+                "line_type": v.get("line_type") if v.get("line_type") in LINE_TYPES else "dialogue",
                 "last_edited_by": v.get("last_edited_by", ""),
                 "last_edited_at": v.get("last_edited_at", "")
             }
@@ -361,17 +365,20 @@ class Project:
                     out[tid] = r
         return out
 
-    def set_annotation(self, line_id, tasks):
+    def set_annotation(self, line_id, tasks, line_type="dialogue", edited_by=None, write=True):
         with self.lock:
             if not 1 <= line_id <= len(self.lines):
                 raise ValueError("bad line id")
 
+            if line_type not in LINE_TYPES:
+                raise ValueError("unknown line type: %s" % line_type)
             clean = self.validate(tasks)
             previous = self.items.get(line_id, {})
             old_tasks = previous.get("tasks", {})
+            old_type = previous.get("line_type", "dialogue")
 
-            if old_tasks != clean:
-                last_edited_by = self.cfg["annotator"]
+            if old_tasks != clean or old_type != line_type:
+                last_edited_by = edited_by or self.cfg["annotator"]
                 last_edited_at = datetime.now(timezone.utc).isoformat(
                     timespec="seconds"
                 )
@@ -379,17 +386,68 @@ class Project:
                 last_edited_by = previous.get("last_edited_by", "")
                 last_edited_at = previous.get("last_edited_at", "")
 
-            if clean or last_edited_at:
+            if clean or last_edited_at or line_type != "dialogue":
                 self.items[line_id] = {
                     "uid": self.lines[line_id - 1]["uid"],
                     "tasks": clean,
+                    "line_type": line_type,
                     "last_edited_by": last_edited_by,
                     "last_edited_at": last_edited_at,
                 }
             else:
                 self.items.pop(line_id, None)
 
-            self._write()
+            if write:
+                self._write()
+
+    # --- pre-annotation import (e.g. a first pass made by an AI from the same subtitle file)
+    def import_preannotations(self, records, edited_by="AI pre-annotation", overwrite=False):
+        """Merge records [{"start" | "id", "line_type", "annotations": {...}}] into this project.
+        Lines are matched by start time (id only breaks ties / is the fallback). Lines that already have
+        annotations or a line type are kept unless overwrite=True. Returns a summary dict."""
+        res = {"imported": 0, "skipped_existing": 0, "empty": 0, "unmatched": [], "errors": []}
+        with self.lock:
+            for rec in records:
+                if not isinstance(rec, dict):
+                    res["errors"].append("not an object: %r" % (rec,))
+                    continue
+                rid = rec.get("id")
+                start = rec.get("start")
+                if isinstance(start, str):
+                    m = TIME_RE.search(start)
+                    start = _secs(m) if m else None
+                elif not isinstance(start, (int, float)) or isinstance(start, bool):
+                    start = None
+                if start is not None:
+                    cands = [l for l in self.lines if abs(l["start"] - start) <= 0.06]
+                    if len(cands) > 1 and isinstance(rid, int):
+                        cands.sort(key=lambda l: abs(l["id"] - rid))
+                    line = cands[0] if cands else None
+                elif isinstance(rid, int) and 1 <= rid <= len(self.lines):
+                    line = self.lines[rid - 1]
+                else:
+                    line = None
+                if line is None:
+                    res["unmatched"].append(rid if rid is not None else rec.get("start"))
+                    continue
+                lid = line["id"]
+                ltype = rec.get("line_type") or "dialogue"
+                tasks = {} if ltype == "description" else (rec.get("annotations") or {})
+                if ltype == "dialogue" and not tasks:
+                    res["empty"] += 1
+                    continue
+                prev = self.items.get(lid)
+                if prev and (prev.get("tasks") or prev.get("line_type") == "description") and not overwrite:
+                    res["skipped_existing"] += 1
+                    continue
+                try:
+                    self.set_annotation(lid, tasks, ltype, edited_by=edited_by, write=False)
+                    res["imported"] += 1
+                except ValueError as e:
+                    res["errors"].append("line %d: %s" % (lid, e))
+            if res["imported"]:
+                self._write()
+        return res
 
     # --- export
     def records(self, include_all=False):
@@ -404,7 +462,9 @@ class Project:
                 rec["text_" + l2] = ln["t2"]
             rec["annotator"] = c["annotator"]
             rec["movie"] = os.path.basename(c["movie"]) if c["movie"] else ""
-            rec["annotations"] = it["tasks"] if it else {}
+            rec["line_type"] = it.get("line_type", "dialogue") if it else "dialogue"
+            # description lines need no annotation, so any old task values are not exported
+            rec["annotations"] = it["tasks"] if it and rec["line_type"] == "dialogue" else {}
             yield rec
 
     def export(self, fmt, include_all=False):
@@ -416,7 +476,7 @@ class Project:
         if fmt == "csv":
             buf = io.StringIO()
             base = ["id", "start", "end", "text_" + self.cfg["lang1"]] + \
-                   (["text_" + self.cfg["lang2"]] if self.cfg["subs2"] else []) + ["annotator"]
+                   (["text_" + self.cfg["lang2"]] if self.cfg["subs2"] else []) + ["annotator", "line_type"]
             cols = base + [x for t in self.schema["tasks"] for x in (t["id"] + "_label", t["id"] + "_rationale")]
             w = csv.DictWriter(buf, cols, extrasaction="ignore")
             w.writeheader()
@@ -460,8 +520,14 @@ def entry_state(task, e):
     return "ok"
 
 
+def is_description(project, line_id):
+    return (project.items.get(line_id) or {}).get("line_type") == "description"
+
+
 def line_state(project, line_id):
-    """(annotated?, incomplete?) for a line."""
+    """(annotated?, incomplete?) for a line. A description line counts as done."""
+    if is_description(project, line_id):
+        return True, False
     tasks = (project.items.get(line_id) or {}).get("tasks", {})
     any_, inc = False, False
     for t in project.schema["tasks"]:
@@ -469,6 +535,28 @@ def line_state(project, line_id):
         any_ |= s != "empty"
         inc |= s == "incomplete"
     return any_, inc
+
+
+def parse_preannotation_text(text):
+    """Accept a JSON list, {"lines"|"annotations"|"items": [...]}, or JSONL; tolerate ```json fences."""
+    text = text.strip().lstrip("\ufeff")
+    text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = []
+        for ln in text.splitlines():
+            ln = ln.strip().rstrip(",")
+            if ln:
+                data.append(json.loads(ln))        # raises ValueError with a useful position
+    if isinstance(data, dict):
+        for k in ("lines", "annotations", "items", "records"):
+            if isinstance(data.get(k), list):
+                return data[k]
+        raise ValueError("Expected a list of line records.")
+    if not isinstance(data, list):
+        raise ValueError("Expected a list of line records.")
+    return data
 
 
 # --------------------------------------------------------------------------- preferences

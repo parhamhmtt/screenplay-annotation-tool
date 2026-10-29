@@ -186,7 +186,7 @@ class EntryEditor(QWidget):
             self.speaker.setFocusPolicy(NOFOCUS)
             self.speaker.setFixedHeight(BTN_H)
             self.speaker.setToolTip("This character is the one speaking this line. Click again to clear it.")
-            self.speaker.setStyleSheet("QPushButton{text-align:left;padding:7px;min-height:20px;background:#e8edf5;border:1px solid #9fb0c7;}"
+            self.speaker.setStyleSheet("QPushButton{text-align:left;padding:7px;min-height:20px;background:#d5deea;border:1px solid #9fb0c7;}"
                                        "QPushButton:hover{background:#c5d3e6;}"
                                        "QPushButton:checked{background:#2458a6;color:#ffffff;border:2px solid #173e78;font-weight:600;}")
             self.speaker.toggled.connect(lambda _=False: (self.focused.emit(), self.changed.emit()))
@@ -639,7 +639,7 @@ class MainWindow(QMainWindow):
         self.f_q.setPlaceholderText("Search text / rationale / character…")
         self.f_q.setClearButtonEnabled(True)
         self.f_status = QComboBox()
-        for lab, key in (("All lines", "all"), ("Annotated", "annotated"), ("Unannotated", "unannotated"), ("Incomplete", "incomplete")):
+        for lab, key in (("All lines", "all"), ("Annotated", "annotated"), ("Unannotated", "unannotated"), ("Incomplete", "incomplete"), ("Description", "description")):
             self.f_status.addItem(lab, key)
         self.f_task = QComboBox()
         self.f_label = QComboBox()
@@ -684,6 +684,15 @@ class MainWindow(QMainWindow):
         self.project_info.setObjectName("muted")
         self.project_info.setWordWrap(True)
         rl.addWidget(self.project_info)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Line type"))
+        self.line_type = QComboBox()
+        self.line_type.addItem("Dialogue", "dialogue")
+        self.line_type.addItem("Description (scene sound / narration - nothing to annotate)", "description")
+        self.line_type.setFocusPolicy(NOFOCUS)
+        self.line_type.currentIndexChanged.connect(self.on_line_type)
+        type_row.addWidget(self.line_type, 1)
+        rl.addLayout(type_row)
         self.task_list = QListWidget()
         self.task_list.setMaximumHeight(136)
         self.task_list.setMinimumHeight(90)
@@ -736,6 +745,7 @@ class MainWindow(QMainWindow):
         a = fm.addAction("Open…")
         a.setShortcut(QKeySequence.StandardKey.Open)
         a.triggered.connect(self.open_dialog)
+        fm.addAction("Import pre-annotations (JSON)…").triggered.connect(self.import_pre)
         fm.addSeparator()
         self.act_all = QAction("Include unannotated lines in export", self, checkable=True)
         fm.addAction(self.act_all)
@@ -951,6 +961,8 @@ class MainWindow(QMainWindow):
     # ---- list rows / filters
     def chips(self, i):
         L = self.P.lines[i]
+        if core.is_description(self.P, L["id"]):
+            return "Description", "Scene sound / narration - no annotation needed", None, False
         tasks = self.P.items.get(L["id"], {}).get("tasks", {})
         parts, tips, color, inc = [], [], None, False
         for t in self.P.schema["tasks"]:
@@ -974,7 +986,8 @@ class MainWindow(QMainWindow):
         it = self.rows[i]
         it.setText(4, txt)
         it.setToolTip(4, tip)
-        it.setForeground(4, QBrush(QColor("#875000" if inc else "#334966")))
+        desc = core.is_description(self.P, self.P.lines[i]["id"])
+        it.setForeground(4, QBrush(QColor("#6b7686" if desc else "#875000" if inc else "#334966")))
         bg = QBrush(QColor("#fff3db")) if inc else QBrush()
         for col in range(5):
             it.setBackground(col, bg)
@@ -997,8 +1010,12 @@ class MainWindow(QMainWindow):
 
         any_, inc = core.line_state(P, L["id"])
         st = self.f_status.currentData()
+        desc = core.is_description(P, L["id"])
 
-        all_complete = all(
+        if st == "description":
+            return desc
+
+        all_complete = desc or all(
             core.entry_state(t, tasks.get(t["id"])) == "ok"
             for t in P.schema["tasks"]
         )
@@ -1013,6 +1030,9 @@ class MainWindow(QMainWindow):
             return False
 
         tid, lb = self.f_task.currentData(), self.f_label.currentData()
+
+        if tid and desc:
+            return False
 
         if tid:
             t = next(x for x in P.schema["tasks"] if x["id"] == tid)
@@ -1122,7 +1142,8 @@ class MainWindow(QMainWindow):
         for offset in range(1, n + 1):
             i = (self.cur + offset) % n
             tasks = self.P.items.get(self.P.lines[i]["id"], {}).get("tasks", {})
-            if not self.rows[i].isHidden() and core.entry_state(task, tasks.get(task["id"])) != "ok":
+            if (not self.rows[i].isHidden() and not core.is_description(self.P, self.P.lines[i]["id"])
+                    and core.entry_state(task, tasks.get(task["id"])) != "ok"):
                 return self.select_line(i, seek=True)
         self.statusBar().showMessage("This task is complete for all visible lines.", 6000)
 
@@ -1161,6 +1182,7 @@ class MainWindow(QMainWindow):
         self.loading = True
         for card in self.cards:
             card.load(tasks.get(card.task["id"]))
+        self.line_type.setCurrentIndex(1 if core.is_description(self.P, self.P.lines[i]["id"]) else 0)
         self.loading = False
         self.update_card_styles()
         self.update_last_edited_label()
@@ -1204,29 +1226,48 @@ class MainWindow(QMainWindow):
 
     def update_card_styles(self):
         complete = 0
+        is_desc = self.line_type.currentData() == "description"
         for k, card in enumerate(self.cards):
             state = core.entry_state(card.task, card.collect())
             complete += state == "ok"
             card.refresh_style(k == self.active, state)
-            state_text = {"empty": "Not started", "ok": "Complete", "incomplete": "Needs attention"}[state]
+            state_text = "Not needed" if is_desc else {"empty": "Not started", "ok": "Complete", "incomplete": "Needs attention"}[state]
             item = self.task_list.item(k)
             item.setText("%d. %s  ·  %s" % (k + 1, card.task["name"], state_text))
             item.setToolTip(card.task["description"] + "\n" + state_text)
-        self.task_progress.setText("%d of %d tasks complete on this line" % (complete, len(self.cards)))
+        desc = self.line_type.currentData() == "description"
+        self.task_list.setEnabled(not desc)
+        self.cards_stack.setEnabled(not desc)
+        self.next_pending.setEnabled(True)
+        if desc:
+            complete = len(self.cards)
+            self.task_progress.setText("Description line - complete, no tasks to fill in")
+        else:
+            self.task_progress.setText("%d of %d tasks complete on this line" % (complete, len(self.cards)))
         self.progress.setRange(0, max(1, len(self.cards)))
         self.progress.setValue(complete)
         if self.P and self.cards:
             task = self.cards[self.active].task
-            done = sum(core.entry_state(task, self.P.items.get(line["id"], {}).get("tasks", {}).get(task["id"])) == "ok"
+            done = sum(core.is_description(self.P, line["id"]) or
+                       core.entry_state(task, self.P.items.get(line["id"], {}).get("tasks", {}).get(task["id"])) == "ok"
                        for line in self.P.lines)
             self.task_hint.setText("%s: %d / %d lines complete. Next pending follows the current filters." %
                                    (task["name"], done, len(self.P.lines)))
 
     def pick(self, k):
-        if self.cards and k < len(self.cards[self.active].task["labels"]):
+        if self.cards and self.line_type.currentData() == "dialogue" and k < len(self.cards[self.active].task["labels"]):
             self.cards[self.active].toggle_label(k)
 
     # ---- saving
+    def on_line_type(self, *_):
+        if self.loading or not self.P or self.cur < 0:
+            self.update_card_styles() if self.P and self.cards else None
+            return
+        self.dirty = True
+        self.saved.setText("● editing…")
+        self.update_card_styles()
+        self.save_timer.start()
+
     def on_card_changed(self, card):
         if self.loading:
             return
@@ -1242,7 +1283,8 @@ class MainWindow(QMainWindow):
         self.dirty = False
         L = self.P.lines[self.cur]
         try:
-            self.P.set_annotation(L["id"], {c.task["id"]: c.collect() for c in self.cards})
+            self.P.set_annotation(L["id"], {c.task["id"]: c.collect() for c in self.cards},
+                                  self.line_type.currentData())
             self.update_last_edited_label()
         except (ValueError, OSError) as e:
             self.dirty = True
@@ -1306,6 +1348,49 @@ class MainWindow(QMainWindow):
             self.select_line(i, seek=False)
 
     # ---- export / close
+    def import_pre(self):
+        if not self.P:
+            QMessageBox.information(self, "Import", "Open a project first.")
+            return
+        self.save_now()
+        if self.dirty:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Import pre-annotations", os.path.dirname(self.P.path),
+                                                "JSON / JSONL (*.json *.jsonl *.txt);;All files (*)")
+        if not paths:
+            return
+        total = {"imported": 0, "skipped_existing": 0, "empty": 0, "unmatched": [], "errors": []}
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    records = core.parse_preannotation_text(f.read())
+            except (OSError, ValueError) as e:
+                total["errors"].append("%s: %s" % (os.path.basename(path), e))
+                continue
+            r = self.P.import_preannotations(records)
+            for k in ("imported", "skipped_existing", "empty"):
+                total[k] += r[k]
+            total["unmatched"] += r["unmatched"]
+            total["errors"] += r["errors"]
+        for i in range(len(self.rows)):
+            self.refresh_row(i)
+        self.rebuild_chars()
+        self.update_stats()
+        self.apply_filters()
+        self.select_line(max(self.cur, 0))
+        msg = "Imported %d line(s). Their 'Last edited by' says AI pre-annotation until you change them." % total["imported"]
+        if total["skipped_existing"]:
+            msg += "\nKept %d line(s) that were already annotated." % total["skipped_existing"]
+        if total["empty"]:
+            msg += "\nIgnored %d dialogue record(s) with no annotations." % total["empty"]
+        if total["unmatched"]:
+            msg += "\nNo matching subtitle line for %d record(s): %s" % (
+                len(total["unmatched"]), ", ".join(str(x) for x in total["unmatched"][:10]))
+        if total["errors"]:
+            msg += "\n\nProblems (%d):\n%s" % (len(total["errors"]), "\n".join(total["errors"][:10]))
+        (QMessageBox.warning if total["errors"] or total["unmatched"] else QMessageBox.information)(
+            self, "Import pre-annotations", msg)
+
     def export(self, fmt_):
         if not self.P:
             return
