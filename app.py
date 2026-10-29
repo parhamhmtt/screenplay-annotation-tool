@@ -134,6 +134,9 @@ def auto_dir(edit):
 
 
 # --------------------------------------------------------------------------- widgets
+BTN_H = 54          # every label button has the same height, with or without a hint line
+
+
 class EntryEditor(QWidget):
     """Label buttons + rationale (+ character name for per-character tasks)."""
     changed = Signal()
@@ -145,7 +148,7 @@ class EntryEditor(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        self.char = self.del_btn = None
+        self.char = self.del_btn = self.speaker = None
         if with_char:
             top = QHBoxLayout()
             self.char = QLineEdit()
@@ -166,8 +169,9 @@ class EntryEditor(QWidget):
         grid.setSpacing(5)
         self.btns = []
         for k, lab in enumerate(task["labels"]):
-            b = QPushButton("%d   %s" % (k + 1, lab["value"]) + ("\n" + lab["hint"] if lab.get("hint") else ""))
+            b = QPushButton("%d   %s" % (k + 1, lab["value"]) + "\n" + (lab.get("hint") or " "))
             b.setCheckable(True)
+            b.setFixedHeight(BTN_H)
             b.setFocusPolicy(NOFOCUS)
             b.setToolTip(lab.get("hint", "") or "Select this label. Click again to clear it.")
             b.setStyleSheet("QPushButton{text-align:left;padding:7px;min-height:20px;}"
@@ -175,6 +179,18 @@ class EntryEditor(QWidget):
             b.clicked.connect(lambda checked=False, i=k: self._clicked(i))
             grid.addWidget(b, k // 2, k % 2)
             self.btns.append(b)
+        if with_char and task.get("speaker_flag"):
+            n = len(self.btns)
+            self.speaker = QPushButton("Speaker\nSpeaking this line")
+            self.speaker.setCheckable(True)
+            self.speaker.setFocusPolicy(NOFOCUS)
+            self.speaker.setFixedHeight(BTN_H)
+            self.speaker.setToolTip("This character is the one speaking this line. Click again to clear it.")
+            self.speaker.setStyleSheet("QPushButton{text-align:left;padding:7px;min-height:20px;background:#e8edf5;border:1px solid #9fb0c7;}"
+                                       "QPushButton:hover{background:#c5d3e6;}"
+                                       "QPushButton:checked{background:#2458a6;color:#ffffff;border:2px solid #173e78;font-weight:600;}")
+            self.speaker.toggled.connect(lambda _=False: (self.focused.emit(), self.changed.emit()))
+            grid.addWidget(self.speaker, n // 2, n % 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
@@ -207,10 +223,12 @@ class EntryEditor(QWidget):
         d = {"label": vals if self.task["multi"] else (vals[0] if vals else ""), "rationale": self.rat.toPlainText()}
         if self.char is not None:
             d = {"character": self.char.text(), **d}
+            if self.speaker is not None:
+                d["is_speaker"] = self.speaker.isChecked()
         return d
 
     def set(self, d):
-        for w in [self.rat, self.char] + self.btns:
+        for w in [self.rat, self.char, self.speaker] + self.btns:
             if w is not None:
                 w.blockSignals(True)
         lab = d.get("label", [] if self.task["multi"] else "")
@@ -220,7 +238,9 @@ class EntryEditor(QWidget):
         self.rat.setPlainText(d.get("rationale", ""))
         if self.char is not None:
             self.char.setText(d.get("character", ""))
-        for w in [self.rat, self.char] + self.btns:
+        if self.speaker is not None:
+            self.speaker.setChecked(bool(d.get("is_speaker", False)))
+        for w in [self.rat, self.char, self.speaker] + self.btns:
             if w is not None:
                 w.blockSignals(False)
 
@@ -360,12 +380,15 @@ class TemplateDialog(QDialog):
         self.labels.setMinimumHeight(120)
         self.multi = QCheckBox("Allow multiple labels for this task")
         self.per_character = QCheckBox("Annotate each character separately")
+        self.speaker_flag = QCheckBox("Add a 'Speaker' button for each character")
+        self.per_character.toggled.connect(self.speaker_flag.setEnabled)
         self.required = QCheckBox("Require a reason for each label")
         form.addRow("Task name", self.task_name)
         form.addRow("Instructions", self.description)
         form.addRow("Label choices\n(one per line)", self.labels)
         form.addRow(self.multi)
         form.addRow(self.per_character)
+        form.addRow(self.speaker_flag)
         form.addRow(self.required)
         layout.addLayout(form)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -383,6 +406,7 @@ class TemplateDialog(QDialog):
         task["description"] = self.description.text().strip()
         task["multi"] = self.multi.isChecked()
         task["per_character"] = self.per_character.isChecked()
+        task["speaker_flag"] = self.per_character.isChecked() and self.speaker_flag.isChecked()
         task["rationale"] = "required" if self.required.isChecked() else "optional"
         old = {l["value"]: l for l in task["labels"]}
         labels = []
@@ -405,6 +429,8 @@ class TemplateDialog(QDialog):
         self.labels.setPlainText("\n".join(l["value"] + (" | " + l["hint"] if l.get("hint") else "") for l in task["labels"]))
         self.multi.setChecked(task["multi"])
         self.per_character.setChecked(task["per_character"])
+        self.speaker_flag.setChecked(task.get("speaker_flag", False))
+        self.speaker_flag.setEnabled(task["per_character"])
         self.required.setChecked(task["rationale"] == "required")
 
     def add_task(self):
@@ -935,7 +961,7 @@ class MainWindow(QMainWindow):
                 labs = r["label"] if isinstance(r["label"], list) else ([r["label"]] if r["label"] else ["?"])
                 bad = not r["label"] or (t["rationale"] == "required" and not r["rationale"].strip()) or (t["per_character"] and not r["character"].strip())
                 inc |= bad
-                who = (r.get("character", "") + ": ") if r.get("character") else ""
+                who = (r.get("character", "") + ("🗣" if r.get("is_speaker") else "") + ": ") if r.get("character") else ""
                 parts.append(("⚠" if bad else "") + "%s·%s%s" % (t["short"], who, "/".join(labs)))
                 tips.append("%s – %s: %s%s" % (t["name"], who + "/".join(labs), r["rationale"] or "(no rationale)", "" if not bad else "   [incomplete]"))
                 if color is None and r["label"]:

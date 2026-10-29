@@ -24,7 +24,7 @@ DEFAULT_SCHEMA = {
         {
             "id": "character_sentiment", "short": "CS", "name": "Character Sentiment",
             "description": "Viewer's perception of a character at this moment (temporal).",
-            "per_character": True, "multi": False, "rationale": "required",
+            "per_character": True, "speaker_flag": True, "multi": True, "rationale": "required",
             "labels": [
                 {"value": "Positive", "hint": "Sympathetic / moral", "color": "#2e9e5b"},
                 {"value": "Negative", "hint": "Unsympathetic / compromised", "color": "#d64545"},
@@ -34,7 +34,7 @@ DEFAULT_SCHEMA = {
         {
             "id": "dialogue_sentiment", "short": "DS", "name": "Dialogue Sentiment",
             "description": "Private state of the speaker, not the calm/loud surface.",
-            "per_character": False, "multi": False, "rationale": "required",
+            "per_character": False, "multi": True, "rationale": "required",
             "labels": [
                 {"value": "Positive", "hint": "Genuine relief / affection", "color": "#2e9e5b"},
                 {"value": "Negative", "hint": "Suppressed fear / resentment", "color": "#d64545"},
@@ -44,7 +44,7 @@ DEFAULT_SCHEMA = {
         {
             "id": "pragmatic_intent", "short": "PI", "name": "Pragmatic Intent",
             "description": "What the speaker is really doing with the sentence.",
-            "per_character": False, "multi": False, "rationale": "required",
+            "per_character": False, "multi": True, "rationale": "required",
             "labels": [
                 {"value": "Taarof", "hint": "Politeness masking intent", "color": "#8e5bd6"},
                 {"value": "Sarcasm/Irony", "hint": "", "color": "#e08a1e"},
@@ -55,7 +55,7 @@ DEFAULT_SCHEMA = {
         {
             "id": "offensive_language", "short": "OL", "name": "Offensive Language",
             "description": "Nuanced offensiveness taxonomy.",
-            "per_character": False, "multi": False, "rationale": "required",
+            "per_character": False, "multi": True, "rationale": "required",
             "labels": [
                 {"value": "Non-Offensive", "hint": "", "color": "#7f8794"},
                 {"value": "Mild Insult", "hint": "e.g. \"Shameless\"", "color": "#d9a400"},
@@ -94,6 +94,7 @@ def normalize_schema(s):
         t.setdefault("description", "")
         t.setdefault("per_character", False)
         t.setdefault("multi", False)
+        t.setdefault("speaker_flag", False)
         t.setdefault("rationale", "required")
         if t["rationale"] not in ("required", "optional"):
             raise ValueError("Rationale must be required or optional: " + t["id"])
@@ -219,6 +220,15 @@ def _safe(name):
     return re.sub(r"[^\w\-.]+", "_", name, flags=re.UNICODE).strip("._") or "annotator"
 
 
+def _schema_core(schema):
+    """Schema without the flags that can be widened later (multi, speaker_flag) - used to accept old files."""
+    s = json.loads(json.dumps(schema))
+    for t in s.get("tasks", []):
+        t.pop("multi", None)
+        t.pop("speaker_flag", None)
+    return s
+
+
 class Project:
     def __init__(self, cfg):
         self.lock = threading.RLock()
@@ -264,7 +274,7 @@ class Project:
         with open(self.path, encoding="utf-8") as f:
             data = json.load(f)
         if data.get("schema") != self.schema["name"] or (data.get("task_schema") is not None and
-                                                         data["task_schema"] != self.schema):
+                                                         _schema_core(data["task_schema"]) != _schema_core(self.schema)):
             raise ValueError("Saved annotations use a different task template. Select the original template, "
                              "or choose a different annotator name or output folder for the new tasks.")
         uids = {l["id"]: l["uid"] for l in self.lines}
@@ -278,13 +288,29 @@ class Project:
                 stale += 1
             self.items[i] = {
                 "uid": uids[i],
-                "tasks": v.get("tasks", {}),
+                "tasks": self._upgrade_tasks(v.get("tasks", {})),
                 "last_edited_by": v.get("last_edited_by", ""),
                 "last_edited_at": v.get("last_edited_at", "")
             }
         if stale:
             self.warnings.append("%d saved annotation(s) did not match the current subtitle file "
                                  "(different file or edited text) - please review them." % stale)
+
+    def _upgrade_tasks(self, tasks):
+        """Old files stored one label as a string; multi-label tasks now store a list."""
+        by_id = {t["id"]: t for t in self.schema["tasks"]}
+        out = {}
+        for tid, val in (tasks or {}).items():
+            t = by_id.get(tid)
+            rows = val if isinstance(val, list) else [val]
+            rows = [dict(r) for r in rows if isinstance(r, dict)]
+            for r in rows:
+                if t and t["multi"] and not isinstance(r.get("label"), list):
+                    r["label"] = [r["label"]] if r.get("label") else []
+                if t and t["per_character"] and t.get("speaker_flag"):
+                    r.setdefault("is_speaker", False)
+            out[tid] = rows if isinstance(val, list) else (rows[0] if rows else val)
+        return out
 
     def _write(self):
         data = {"version": 1, "annotator": self.cfg["annotator"], "schema": self.schema["name"],
@@ -320,6 +346,8 @@ class Project:
                 r = {"label": lab, "rationale": str(e.get("rationale", "")).strip()[:5000]}
                 if need_char:
                     r = {"character": str(e.get("character", "")).strip()[:200], **r}
+                    if t.get("speaker_flag"):
+                        r["is_speaker"] = bool(e.get("is_speaker", False))
                 return r
 
             if t["per_character"]:
@@ -399,7 +427,10 @@ class Project:
                     if v is None:
                         continue
                     if t["per_character"]:
-                        row[t["id"] + "_label"] = "; ".join("%s=%s" % (x["character"], x["label"]) for x in v)
+                        def labs(x):
+                            return "/".join(x["label"]) if isinstance(x["label"], list) else x["label"]
+                        row[t["id"] + "_label"] = "; ".join(
+                            "%s%s=%s" % (x["character"], " [speaker]" if x.get("is_speaker") else "", labs(x)) for x in v)
                         row[t["id"] + "_rationale"] = " | ".join(x["rationale"] for x in v)
                     else:
                         lab = v["label"]
